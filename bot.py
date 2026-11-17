@@ -1962,6 +1962,55 @@ class RunLogger:
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def wait_for_active(log):
+    """Distinguish an inactive case from a broken API connection at startup."""
+    if not isinstance(API_KEY, str) or not API_KEY.strip():
+        raise RuntimeError("API key is blank. Set API_KEY in com5_template.py to your RIT Client key, then run again.")
+    SESSION.headers.update({"X-API-Key": API_KEY.strip()})
+    log.info(f"Connecting to RIT API: {BASE}/case")
+    failures = 0
+    last_status = None
+    next_status_log = 0
+    while True:
+        try:
+            response = SESSION.get(f"{BASE}/case", timeout=(3, 5))
+        except requests.RequestException as exc:
+            failures += 1
+            log.error(f"[STARTUP] Cannot reach RIT API ({type(exc).__name__}), attempt {failures}/3. "
+                      "Check that RIT Client is open and its API port matches RIT_BASE_URL.")
+            if failures >= 3:
+                raise RuntimeError("RIT API connection failed. This is a connection problem, not an inactive case.") from exc
+            time.sleep(1)
+            continue
+        if response.status_code in (401, 403):
+            raise RuntimeError(f"RIT API rejected access (HTTP {response.status_code}). "
+                               "Check your current RIT Client API key in com5_template.py and API access settings.")
+        if not response.ok:
+            failures += 1
+            log.error(f"[STARTUP] RIT /case returned HTTP {response.status_code}: {response.text[:300]}")
+            if failures >= 3:
+                raise RuntimeError("RIT /case failed three times. Check the API address and server response above.")
+            time.sleep(1)
+            continue
+        try:
+            case = response.json()
+        except ValueError as exc:
+            raise RuntimeError("The API address returned non-JSON content; check RIT_BASE_URL and the API port.") from exc
+        if not isinstance(case, dict) or not case.get("status"):
+            raise RuntimeError("The API response has no case status; check that RIT_BASE_URL points to the RIT API.")
+        failures = 0
+        status = case["status"]
+        if status == "ACTIVE":
+            log.info(f"[STARTUP] Case ACTIVE: period={case.get('period')} tick={case.get('tick')}. Starting live trading.")
+            return case
+        if status != last_status or time.monotonic() >= next_status_log:
+            log.info(f"[STARTUP] Connected. Case status={status}, period={case.get('period')}, tick={case.get('tick')}. "
+                     "Waiting for the case to be started/resumed in RIT.")
+            next_status_log = time.monotonic() + 5
+            last_status = status
+        time.sleep(.5)
+
+
 def main():
     log = RunLogger()
     log.info("=" * 60)
@@ -1972,15 +2021,16 @@ def main():
 
     config = CaseConfig()
 
-    log.info("\nWaiting for case to become ACTIVE...")
-    while True:
-        try:
-            case = _get("/case")
-            if case.get("status") == "ACTIVE":
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
+    try:
+        wait_for_active(log)
+    except RuntimeError as exc:
+        log.error(f"[STARTUP STOP] {exc}")
+        log.close()
+        return 1
+    except KeyboardInterrupt:
+        log.info("Startup cancelled; no trading started.")
+        log.close()
+        return 0
 
     config.discover()
     log.save_config(config)

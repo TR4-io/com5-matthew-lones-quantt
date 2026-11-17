@@ -30,3 +30,7 @@ Root causes addressed in the physical paths:
 The original stopping behavior remains: Ctrl+C does not automatically liquidate the account. Unknown physical creation results may still require manual reconciliation; these fixes do not promise cleanup if the server cannot confirm what happened.
 
 Validation: 13 offline tests covering direct pipeline parameters, endpoint storage, failed input purchase, delivery arrival, automatic pipeline expiry, actual refinery-ID selection, rejected use cleanup, failed release retry/tracking, delayed sale snapshots, full-batch gating and period-boundary retention; Python compilation. No live RIT execution performed.
+
+## Startup visibility fix
+
+The original wait loop swallowed all connection, authentication and response errors, displaying only an inactive-case message. Startup now validates that a key is configured, reports authentication errors, bounds connection/server attempts and request timeouts, and displays the actual server case status while waiting. No orders are sent by startup checks; live trading begins automatically once ACTIVE. Six startup regressions bring the total to 19 passing offline tests. This does not start or resume the RIT server itself.
