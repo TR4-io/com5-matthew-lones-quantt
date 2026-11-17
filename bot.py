@@ -3,8 +3,8 @@ COM5 Commodities Capstone — Competition Bot
 ============================================
 Multi-strategy automated trading bot for Rotman COM5.
 
-ALL competition parameters are discovered dynamically from the API at startup.
-Zero hardcoded values — adapts to any admin configuration.
+Server limits and asset metadata are validated at startup.
+Signals retain COM5-specific assumptions; see START_HERE.md.
 
 Strategies (priority order):
   1. EIA Alpha       — directional trading on EIA report releases
@@ -14,10 +14,12 @@ Strategies (priority order):
   5. Crack Spread    — refinery 3:2:1 conversion
   6. Market Making   — liquidity provision between events
 
-Usage:  python bot.py
+Usage: python bot.py --check; python bot.py --live [--futures-only]
 """
 
-import requests
+import argparse
+import math
+from runtime import Client, TradingHalt, risk_allows, conversion_spec
 import time
 import re
 import json
@@ -26,64 +28,34 @@ import sys
 import logging
 from datetime import datetime
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 
 from com5_template import API_KEY, BASE, HEADERS
 
-# ── Pooled session for all API calls ────────────────────────────────────────
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+CLIENT = Client(BASE, HEADERS)  # Writes remain disabled until --live.
 
 
 def _get(endpoint, params=None):
-    """GET with connection pooling and rate-limit retry."""
-    while True:
-        r = SESSION.get(f"{BASE}{endpoint}", params=params)
-        if r.status_code == 429:
-            try:
-                wait = r.json().get("wait", 0.5)
-            except Exception:
-                wait = 0.5
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        return r.json()
+    return CLIENT.request("GET", endpoint, params)
 
 
 def _post(endpoint, params=None):
-    """POST with connection pooling and rate-limit retry."""
-    while True:
-        r = SESSION.post(f"{BASE}{endpoint}", params=params)
-        if r.status_code == 429:
-            try:
-                wait = r.json().get("wait", 0.5)
-            except Exception:
-                wait = 0.5
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        return r.json()
+    return CLIENT.request("POST", endpoint, params)
 
 
 def _delete(endpoint):
-    """DELETE with connection pooling and rate-limit retry."""
-    while True:
-        r = SESSION.delete(f"{BASE}{endpoint}", headers=HEADERS)
-        if r.status_code == 429:
-            try:
-                wait = r.json().get("wait", 0.5)
-            except Exception:
-                wait = 0.5
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        if r.status_code == 204 or not r.text:
-            return {"success": True}
-        return r.json()
+    return CLIENT.request("DELETE", endpoint)
+
+
+def active_future(state):
+    return "CL-1F" if state.period <= 1 else "CL-2F"
+
+
+def filled(orders):
+    return sum(int(o.get("quantity_filled", 0)) for o in orders)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CASE CONFIG — dynamically discovered from API, zero hardcoding
+#  CASE CONFIG — live metadata with explicit COM5 assumptions
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CaseConfig:
@@ -95,6 +67,8 @@ class CaseConfig:
 
     def __init__(self):
         # ── Case structure (from /case) ─────────────────────────────
+        self.physical_enabled = True
+        self.raw_assets = {}
         self.ticks_per_period = 600  # overwritten by discover()
         self.total_periods = 2
 
@@ -181,12 +155,12 @@ class CaseConfig:
             ticker = s["ticker"]
             self.tickers[ticker] = {
                 "size": s.get("size", 1000),
-                "shortable": s.get("type") == "FUTURE",
+                "shortable": bool(s.get("is_shortable", False)),
                 "type": s.get("type", ""),
             }
             # Try to get max trade size and fees from API
-            if s.get("maximum_trade_size"):
-                self.max_order_size = s["maximum_trade_size"]
+            if s.get("max_trade_size"):
+                self.max_order_size = s["max_trade_size"]
             if s.get("trading_fees") is not None:
                 self.fee_per_contract = s["trading_fees"]
 
@@ -194,7 +168,7 @@ class CaseConfig:
         # Override from known COM5 rules if API doesn't expose it clearly
         for ticker in self.tickers:
             t = self.tickers[ticker]["type"].upper()
-            self.tickers[ticker]["shortable"] = t in ("FUTURE", "FUTURES")
+            self.tickers[ticker]["shortable"] = bool(next(r for r in securities if r["ticker"] == ticker).get("is_shortable", False))
 
         # ── /limits ─────────────────────────────────────────────────
         limits = _get("/limits")
@@ -224,80 +198,41 @@ class CaseConfig:
             if t not in self.net_limits:
                 self.net_limits[t] = 100
 
-        # ── /assets ─────────────────────────────────────────────────
-        # Case-brief fallbacks for fields the API may not expose
-        ASSET_FALLBACKS = {
-            "CL-STORAGE":  {"capacity": 10000, "transfer_sec": 0,  "max_leases": 10},
-            "AK-STORAGE":  {"capacity": 10000, "transfer_sec": 0,  "max_leases": 10},
-            "NYC-STORAGE": {"capacity": 10000, "transfer_sec": 0,  "max_leases": 10},
-            "AK-CS-PIPE":  {"capacity": 10000, "transfer_sec": 30, "max_leases": 10},
-            "CS-NYC-PIPE": {"capacity": 10000, "transfer_sec": 30, "max_leases": 10},
-            "CL-REFINERY": {"capacity": 30000, "transfer_sec": 45, "max_leases": 1},
-        }
-        assets = _get("/assets")
-        if assets:
-            for a in assets:
-                ticker = a.get("ticker", "")
-                fb = ASSET_FALLBACKS.get(ticker, {})
-                raw_cap = a.get("total_quantity", 0)
-                raw_xfer = a.get("transfer_sec", 0)
-                raw_max = a.get("max_leases", 0)
-                self.assets[ticker] = {
-                    "cost": a.get("lease_price", fb.get("cost", 0)),
-                    # Use API value only if it looks correct, else fallback
-                    "capacity": raw_cap if raw_cap >= 10000 else fb.get("capacity", 10000),
-                    "transfer_sec": raw_xfer if raw_xfer > 0 else fb.get("transfer_sec", 0),
-                    "max_leases": raw_max if raw_max >= 1 else fb.get("max_leases", 10),
-                }
-        # Ensure all expected assets exist (even if API didn't return them)
-        for ticker, fb in ASSET_FALLBACKS.items():
-            if ticker not in self.assets:
-                self.assets[ticker] = {"cost": 0, **fb}
+        self.load_assets(_get("/assets"))
+        if self.physical_enabled:
+            for ticker, source, outputs in (
+                ("AK-CS-PIPE", "CL-AK", {"CL": 10}),
+                ("CS-NYC-PIPE", "CL", {"CL-NYC": 10}),
+                ("CL-REFINERY", "CL", {"RB": 20, "HO": 10}),
+            ):
+                conversion_spec(self.raw_assets[ticker], source, outputs)
 
         self._derive()
         self._print_config()
 
+    def load_assets(self, assets):
+        self.raw_assets = {a["ticker"]: a for a in assets}
+        self.assets = {}
+        for a in assets:
+            containment = a.get("containment") or {}
+            source_size = self.get_contract_size(containment.get("ticker", "CL"))
+            conversions = a.get("convert_from") or []
+            capacity = float(containment.get("quantity", 0)) * source_size
+            if conversions:
+                capacity = float(conversions[0]["quantity"]) * self.get_contract_size(conversions[0]["ticker"])
+            self.assets[a["ticker"]] = {
+                "cost": float(a["lease_price"]), "capacity": capacity,
+                "transfer_sec": int(a.get("ticks_per_conversion", 0)),
+                "max_leases": int(a.get("total_quantity", 0)),
+            }
+
     def refresh(self):
-        """Re-check assets and limits for mid-case changes. Call every 30 ticks."""
-        changed = False
-
-        try:
-            assets = _get("/assets")
-            if assets:
-                for a in assets:
-                    ticker = a.get("ticker", "")
-                    new_cost = a.get("lease_price", 0)
-                    if ticker in self.assets and self.assets[ticker]["cost"] != new_cost:
-                        old = self.assets[ticker]["cost"]
-                        self.assets[ticker]["cost"] = new_cost
-                        print(f"  [CONFIG] {ticker} cost changed: "
-                              f"${old:,.0f} -> ${new_cost:,.0f}")
-                        changed = True
-        except Exception as e:
-            print(f"  [ERR] config refresh assets: {e}")
-
-        try:
-            limits = _get("/limits")
-            if limits:
-                for lim in limits:
-                    ticker = lim.get("ticker", "")
-                    new_net = lim.get("net_limit", 100)
-                    if ticker in self.net_limits and self.net_limits[ticker] != new_net:
-                        old = self.net_limits[ticker]
-                        self.net_limits[ticker] = new_net
-                        print(f"  [CONFIG] {ticker} net limit changed: {old} -> {new_net}")
-                        changed = True
-                    new_gross = lim.get("gross_limit")
-                    if new_gross and new_gross != self.gross_limit:
-                        print(f"  [CONFIG] Gross limit changed: "
-                              f"{self.gross_limit} -> {new_gross}")
-                        self.gross_limit = new_gross
-                        changed = True
-        except Exception as e:
-            print(f"  [ERR] config refresh limits: {e}")
-
-        if changed:
-            self._derive()
+        self.load_assets(_get("/assets"))
+        limits = _get("/limits")
+        if not isinstance(limits, list) or not limits:
+            raise TradingHalt("Missing live limits")
+        self.gross_limit = min(float(r["gross_limit"]) for r in limits)
+        self._derive()
 
     def _derive(self):
         """Compute derived values from discovered parameters."""
@@ -374,11 +309,11 @@ class CaseConfig:
 
     def get_asset_cost(self, asset_ticker):
         """Get current lease cost for an asset."""
-        return self.assets.get(asset_ticker, {}).get("cost", 0)
+        return self.assets.get(asset_ticker, {}).get("cost", float("inf"))
 
     def get_asset_capacity(self, asset_ticker):
         """Get capacity for an asset."""
-        return self.assets.get(asset_ticker, {}).get("capacity", 10000)
+        return self.assets.get(asset_ticker, {}).get("capacity", 0)
 
     def get_transfer_sec(self, asset_ticker):
         """Get transfer time for an asset."""
@@ -435,6 +370,7 @@ class StateManager:
 
         # Pipeline tracking
         self.active_pipelines = []
+        self.conversion_outputs = set()
 
         # Per-strategy gross usage
         self.strategy_gross = defaultdict(int)
@@ -460,9 +396,7 @@ class StateManager:
         self.start_price = None
         self.fair_value = None
         self.scheduled_exits.clear()
-        self.refinery_lease_id = None
-        self.refinery_start_tick = None
-        self.active_pipelines.clear()
+        # Conversion tracking survives period boundaries.
         self.price_history.clear()
         print(f"\n{'='*60}")
         print(f"  PERIOD {new_period} STARTED")
@@ -528,7 +462,7 @@ class StateManager:
         return self.positions.get(ticker, 0)
 
     def total_gross(self):
-        return sum(abs(p) for p in self.positions.values())
+        return sum(abs(p) * max((float(m["units"]) for m in self.securities.get(t, {}).get("limits", [])), default=1) for t, p in self.positions.items())
 
     def available_gross(self, strategy):
         budget = self.config.gross_budget.get(strategy, 0)
@@ -568,66 +502,103 @@ class StateManager:
 
 class ExecutionEngine:
     def __init__(self, state, config):
-        self.state = state
-        self.config = config
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.state, self.config = state, config
+        self.logger = None
 
-    def place_order(self, ticker, action, quantity, price=None, order_type="MARKET"):
+    def refresh_positions(self):
+        rows = _get("/securities")
+        self.state.update_from_securities(rows)
+        return rows
+
+    def approved_quantity(self, ticker, action, desired):
+        orders = _get("/orders", {"status": "OPEN"})
+        rows = self.refresh_positions()
+        if not any(r["ticker"] == ticker for r in rows):
+            return 0
+        limits = _get("/limits")
+        for qty in range(int(desired), 0, -1):
+            if risk_allows(rows, limits, orders, ticker, action, qty):
+                return qty
+        return 0
+
+    def place_order(self, ticker, action, quantity, price=None, order_type="MARKET", reduce_only=False):
         if quantity <= 0:
             return None
-        quantity = min(quantity, self.config.max_order_size)
-        if action == "SELL" and not self.config.is_shortable(ticker):
-            held = self.state.get_position(ticker)
-            if quantity > held:
-                quantity = held
-                if quantity <= 0:
-                    return None
-        params = {"ticker": ticker, "type": order_type,
-                  "quantity": quantity, "action": action}
-        if price is not None and order_type == "LIMIT":
-            params["price"] = round(price, 2)
-        try:
-            return _post("/orders", params=params)
-        except Exception as e:
-            print(f"  [ERR] order {action} {quantity} {ticker}: {e}")
+        orders = _get("/orders", {"status": "OPEN"})
+        rows = self.refresh_positions()
+        row = next((r for r in rows if r["ticker"] == ticker), None)
+        if row is None or (ticker == "CL-1F" and self.state.period > 1):
             return None
+        cap = int(row.get("max_trade_size", self.config.max_order_size))
+        quantity = min(int(quantity), cap)
+        if action == "SELL" and not row.get("is_shortable", False):
+            quantity = min(quantity, int(row["position"]))
+        if quantity <= 0:
+            return None
+        if reduce_only:
+            quantity = min(quantity, max(0, int(row["position"]) if action == "SELL" else -int(row["position"])))
+        if quantity <= 0:
+            return None
+        if not risk_allows(rows, _get("/limits"), orders, ticker, action, quantity):
+            print(f"  [RISK] Blocked {action} {quantity} {ticker}")
+            return None
+        params = {"ticker": ticker, "type": order_type, "quantity": quantity, "action": action}
+        if order_type == "LIMIT":
+            if price is None or not math.isfinite(price) or price <= 0:
+                raise TradingHalt("Invalid limit price")
+            params["price"] = round(price, 2)
+        result = _post("/orders", params)
+        if not isinstance(result, dict) or "order_id" not in result:
+            CLIENT.uncertain_write = True
+            raise TradingHalt("Order acknowledgement has no ID; not resubmitting")
+        if self.logger:
+            self.logger.event("order_ack", self.state.period, self.state.tick, order=result)
+        if order_type == "MARKET":
+            result = self.finish_order(result)
+            self.refresh_positions()
+        if self.logger:
+            self.logger.event("order_result", self.state.period, self.state.tick, order=result)
+        return result
 
-    def place_split_orders(self, ticker, action, total_quantity, price=None,
-                           order_type="MARKET"):
-        if total_quantity <= 0:
-            return []
-        orders = []
-        remaining = total_quantity
+    def finish_order(self, result):
+        oid = result["order_id"]
+        for attempt in range(12):
+            if result.get("status") in ("TRANSACTED", "CANCELLED"):
+                if not 0 <= float(result["quantity_filled"]) <= float(result["quantity"]):
+                    raise TradingHalt("Invalid cumulative fill quantity")
+                return result
+            if attempt == 6:
+                _delete(f"/orders/{oid}")
+            time.sleep(.1)
+            result = _get(f"/orders/{oid}")
+        raise TradingHalt(f"Order {oid} remains unresolved; stopping entries")
+
+    def place_split_orders(self, ticker, action, total_quantity, price=None, order_type="MARKET", reduce_only=False):
+        orders, remaining = [], int(total_quantity)
         while remaining > 0:
-            qty = min(remaining, self.config.max_order_size)
-            result = self.place_order(ticker, action, qty, price, order_type)
-            if result:
-                orders.append(result)
-            remaining -= qty
+            result = self.place_order(ticker, action, remaining, price, order_type, reduce_only=reduce_only)
+            if not result:
+                break
+            orders.append(result)
+            done = int(result.get("quantity_filled", 0)) if order_type == "MARKET" else int(result["quantity"])
+            if done <= 0:
+                break
+            remaining -= done
+            if order_type == "MARKET" and done < int(result["quantity"]):
+                break
         return orders
 
     def cancel_all_orders(self):
-        """Cancel all open orders. Tries multiple API approaches."""
-        # Try POST /commands/cancel first (template approach)
-        try:
-            return _post("/commands/cancel")
-        except Exception:
-            pass
-        # Fallback: DELETE each open order individually
-        try:
-            orders = _get("/orders", {"status": "OPEN"})
-            if orders:
-                for o in orders:
-                    oid = o.get("order_id")
-                    if oid:
-                        try:
-                            _delete(f"/orders/{oid}")
-                        except Exception:
-                            pass
-                return {"cancelled": len(orders)}
-        except Exception as e:
-            print(f"  [ERR] cancel all: {e}")
-        return None
+        if not _get("/orders", {"status": "OPEN"}):
+            self.refresh_positions()
+            return
+        _post("/commands/cancel", {"all": 1})
+        for _ in range(10):
+            if not _get("/orders", {"status": "OPEN"}):
+                self.refresh_positions()
+                return
+            time.sleep(.1)
+        raise TradingHalt("Cancellation not confirmed; stopping entries")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -646,7 +617,12 @@ class StorageManager:
             return False
 
         contract_size = self.config.get_contract_size("CL")
-        barrels_needed = contracts_needed * contract_size
+        self.state.update_from_securities(_get("/securities"))
+        self.state.leases = {l["id"]: l for l in _get("/leases")}
+        held_ticker = {"CL": "CL", "AK": "CL-AK", "NYC": "CL-NYC"}[location]
+        barrels_needed = (contracts_needed + max(0, self.state.get_position(held_ticker))) * contract_size
+        if self.config.get_asset_capacity(storage_ticker) <= 0:
+            raise TradingHalt(f"Missing containment metadata for {storage_ticker}")
         current_capacity = self._get_leased_capacity(storage_ticker)
 
         while current_capacity < barrels_needed:
@@ -670,26 +646,16 @@ class StorageManager:
         return count * self.config.get_asset_capacity(storage_ticker)
 
     def release_empty_storage(self):
-        contract_size = self.config.get_contract_size("CL")
-        needed = {
-            "CL-STORAGE": max(0, self.state.get_position("CL")) * contract_size,
-            "AK-STORAGE": max(0, self.state.get_position("CL-AK")) * contract_size,
-            "NYC-STORAGE": max(0, self.state.get_position("CL-NYC")) * contract_size,
-        }
-        for lease_id, lease in list(self.state.leases.items()):
-            ticker = lease.get("ticker", "")
-            if ticker not in needed:
-                continue
-            capacity = self.config.get_asset_capacity(ticker)
-            if needed[ticker] <= 0:
-                try:
-                    _delete(f"/leases/{lease_id}")
-                    del self.state.leases[lease_id]
-                    print(f"  [STORAGE] Released {ticker} (lease {lease_id})")
-                except Exception as e:
-                    print(f"  [ERR] release {ticker}: {e}")
-            else:
-                needed[ticker] -= capacity
+        leases = _get("/leases")
+        self.state.leases = {l["id"]: l for l in leases}
+        # Keep destination capacity while any conversion lease remains unresolved.
+        if self.state.active_pipelines or self.state.refinery_lease_id is not None:
+            return
+        if any(l.get("ticker") in ("AK-CS-PIPE", "CS-NYC-PIPE", "CL-REFINERY") for l in leases):
+            return
+        for lease in leases:
+            if lease.get("ticker") in ("CL-STORAGE", "AK-STORAGE", "NYC-STORAGE") and lease.get("containment_usage") == 0:
+                _delete(f"/leases/{lease['id']}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -790,7 +756,7 @@ class EIAEngine:
         return None
 
     def process(self, news_item):
-        """EIA is our guaranteed alpha. MAX OUT every position on every signal.
+        """Trade parsed EIA surprises within live risk constraints; alpha is not guaranteed.
 
         Bullish: max out CL-1F, CL-2F, CL, CL-AK, CL-NYC, HO, RB
         Bearish: max out CL-1F, CL-2F (only shortable tickers)
@@ -828,7 +794,7 @@ class EIAEngine:
         self.execution.cancel_all_orders()
 
         # ── FUTURES: CL-1F and CL-2F (shortable both ways) ─────────
-        for fticker in ["CL-1F", "CL-2F"]:
+        for fticker in (["CL-1F", "CL-2F"] if self.state.period <= 1 else ["CL-2F"]):
             net_limit = self.config.get_net_limit(fticker)
             if bullish:
                 qty = self.state.available_net_buy(fticker)
@@ -838,8 +804,8 @@ class EIAEngine:
             if qty > 0:
                 action = "BUY" if bullish else "SELL"
                 print(f"  [EIA] {action} {qty} {fticker} (MAX)")
-                self.execution.place_split_orders(fticker, action, qty,
-                                                  order_type="MARKET")
+                qty = filled(self.execution.place_split_orders(fticker, action, qty,
+                                                  order_type="MARKET"))
                 total_traded += qty
 
                 # Schedule tiered exits
@@ -858,15 +824,16 @@ class EIAEngine:
                      exit_action, t3, "eia"))
 
         # ── BULLISH ONLY: ALL spot & product tickers (not shortable) ─
-        if bullish:
+        if bullish and self.config.physical_enabled and not self.state.active_pipelines and self.state.refinery_lease_id is None:
             # CL spot — needs storage
             cl_qty = min(
                 self.state.available_net_buy("CL"),
                 self.config.get_net_limit("CL"))
+            cl_qty = self.execution.approved_quantity("CL", "BUY", cl_qty)
             if cl_qty > 0 and self.storage.ensure_storage("CL", cl_qty):
                 print(f"  [EIA] BUY {cl_qty} CL spot (MAX)")
-                self.execution.place_split_orders("CL", "BUY", cl_qty,
-                                                  order_type="MARKET")
+                cl_qty = filled(self.execution.place_split_orders("CL", "BUY", cl_qty,
+                                                  order_type="MARKET"))
                 total_traded += cl_qty
                 self.state.scheduled_exits.append(
                     (tick + self.config.eia_exit_fast_ticks, "CL",
@@ -876,10 +843,11 @@ class EIAEngine:
             ak_qty = min(
                 self.state.available_net_buy("CL-AK"),
                 self.config.get_net_limit("CL-AK"))
+            ak_qty = self.execution.approved_quantity("CL-AK", "BUY", ak_qty)
             if ak_qty > 0 and self.storage.ensure_storage("AK", ak_qty):
                 print(f"  [EIA] BUY {ak_qty} CL-AK (MAX)")
-                self.execution.place_split_orders("CL-AK", "BUY", ak_qty,
-                                                  order_type="MARKET")
+                ak_qty = filled(self.execution.place_split_orders("CL-AK", "BUY", ak_qty,
+                                                  order_type="MARKET"))
                 total_traded += ak_qty
                 self.state.scheduled_exits.append(
                     (tick + self.config.eia_exit_fast_ticks, "CL-AK",
@@ -889,10 +857,11 @@ class EIAEngine:
             nyc_qty = min(
                 self.state.available_net_buy("CL-NYC"),
                 self.config.get_net_limit("CL-NYC"))
+            nyc_qty = self.execution.approved_quantity("CL-NYC", "BUY", nyc_qty)
             if nyc_qty > 0 and self.storage.ensure_storage("NYC", nyc_qty):
                 print(f"  [EIA] BUY {nyc_qty} CL-NYC (MAX)")
-                self.execution.place_split_orders("CL-NYC", "BUY", nyc_qty,
-                                                  order_type="MARKET")
+                nyc_qty = filled(self.execution.place_split_orders("CL-NYC", "BUY", nyc_qty,
+                                                  order_type="MARKET"))
                 total_traded += nyc_qty
                 self.state.scheduled_exits.append(
                     (tick + self.config.eia_exit_fast_ticks, "CL-NYC",
@@ -903,10 +872,11 @@ class EIAEngine:
                 p_qty = min(
                     self.state.available_net_buy(pticker),
                     self.config.get_net_limit(pticker))
+                p_qty = self.execution.approved_quantity(pticker, "BUY", p_qty)
                 if p_qty > 0:
                     print(f"  [EIA] BUY {p_qty} {pticker} (MAX)")
-                    self.execution.place_split_orders(pticker, "BUY", p_qty,
-                                                      order_type="MARKET")
+                    p_qty = filled(self.execution.place_split_orders(pticker, "BUY", p_qty,
+                                                      order_type="MARKET"))
                     total_traded += p_qty
                     self.state.scheduled_exits.append(
                         (tick + self.config.eia_exit_fast_ticks, pticker,
@@ -1001,18 +971,18 @@ class NewsEngine:
 
         action = "BUY" if score > 0 else "SELL"
         if action == "BUY":
-            contracts = min(contracts, self.state.available_net_buy("CL-1F"),
+            contracts = min(contracts, self.state.available_net_buy(active_future(self.state)),
                            self.state.available_gross("news"))
         else:
-            contracts = min(contracts, self.state.available_net_sell("CL-1F"),
+            contracts = min(contracts, self.state.available_net_sell(active_future(self.state)),
                            self.state.available_gross("news"))
         if contracts <= 0:
             return
 
         print(f"  [NEWS] score={score:+.1f} ({matches} matches) -> "
-              f"{action} {contracts} CL-1F")
-        self.execution.place_split_orders("CL-1F", action, contracts,
-                                          order_type="MARKET")
+              f"{action} {contracts} {active_future(self.state)}")
+        contracts = filled(self.execution.place_split_orders(active_future(self.state), action, contracts,
+                                          order_type="MARKET"))
         self.state.strategy_gross["news"] += contracts
 
         tick = self.state.tick
@@ -1020,9 +990,9 @@ class NewsEngine:
         t1 = int(contracts * 0.70)
         t2 = contracts - t1
         self.state.scheduled_exits.append(
-            (tick + self.config.news_exit_fast_ticks, "CL-1F", exit_action, t1, "news"))
+            (tick + self.config.news_exit_fast_ticks, active_future(self.state), exit_action, t1, "news"))
         self.state.scheduled_exits.append(
-            (tick + self.config.news_exit_slow_ticks, "CL-1F", exit_action, t2, "news"))
+            (tick + self.config.news_exit_slow_ticks, active_future(self.state), exit_action, t2, "news"))
 
     def _handle_pipeline_cost_change(self, news_item):
         text = (news_item.get("headline", "") + " " +
@@ -1052,7 +1022,7 @@ class BasisEngine:
 
     def evaluate(self):
         cl_bid, cl_ask, cl_last = self.state.get_price("CL")
-        f1_bid, f1_ask, f1_last = self.state.get_price("CL-1F")
+        f1_bid, f1_ask, f1_last = self.state.get_price(active_future(self.state))
         if cl_last is None or f1_last is None or cl_last <= 0 or f1_last <= 0:
             return
 
@@ -1074,7 +1044,7 @@ class BasisEngine:
             days = self.days_remaining()
             storage_cost = self.config.get_asset_cost("CL-STORAGE") * days
             fee = 20 * self.config.fee_per_contract
-            profit = mispricing * 10000 - storage_cost - fee
+            profit = (f1_bid - cl_ask) * 10000 - storage_cost - fee if f1_bid and cl_ask else float("-inf")
             if profit > self.config.basis_min_profit:
                 self._execute_cash_carry(cl_ask, f1_bid, profit)
 
@@ -1088,262 +1058,186 @@ class BasisEngine:
 
         if market_basis > theo_basis + self.config.convergence_min_basis:
             if (self.state.available_net_buy("CL") >= contracts and
-                    self.state.available_net_sell("CL-1F") >= contracts):
+                    self.state.available_net_sell(active_future(self.state)) >= contracts):
                 if self.storage.ensure_storage("CL", contracts):
                     print(f"  [BASIS] Convergence: buy CL, short CL-1F "
                           f"(basis={market_basis:.3f}, theo={theo_basis:.3f})")
-                    self.execution.place_split_orders("CL", "BUY", contracts,
-                                                     order_type="MARKET")
-                    self.execution.place_split_orders("CL-1F", "SELL", contracts,
-                                                     order_type="MARKET")
-                    self.state.strategy_gross["basis"] += contracts * 2
+                    self._trade_pair("CL", "BUY", active_future(self.state), "SELL", contracts)
 
         elif market_basis < theo_basis - self.config.convergence_min_basis:
             held_cl = self.state.get_position("CL")
             sell_qty = min(contracts, held_cl)
-            if sell_qty > 0 and self.state.available_net_buy("CL-1F") >= sell_qty:
+            if sell_qty > 0 and self.state.available_net_buy(active_future(self.state)) >= sell_qty:
                 print(f"  [BASIS] Convergence: sell CL, buy CL-1F "
                       f"(basis={market_basis:.3f}, theo={theo_basis:.3f})")
-                self.execution.place_split_orders("CL", "SELL", sell_qty,
-                                                  order_type="MARKET")
-                self.execution.place_split_orders("CL-1F", "BUY", sell_qty,
-                                                  order_type="MARKET")
-                self.state.strategy_gross["basis"] += sell_qty * 2
+                self._trade_pair("CL", "SELL", active_future(self.state), "BUY", sell_qty)
 
     def _execute_cash_carry(self, cl_ask, f1_bid, estimated_profit):
         contracts = 10
         if (self.state.available_net_buy("CL") < contracts or
-                self.state.available_net_sell("CL-1F") < contracts or
+                self.state.available_net_sell(active_future(self.state)) < contracts or
                 self.state.available_gross("basis") < contracts * 2):
             return
         if not self.storage.ensure_storage("CL", contracts):
             return
         print(f"  [BASIS] Cash-carry: buy 10 CL, short 10 CL-1F "
               f"(est profit=${estimated_profit:.0f})")
-        self.execution.place_split_orders("CL", "BUY", contracts,
-                                          order_type="MARKET")
-        self.execution.place_split_orders("CL-1F", "SELL", contracts,
-                                          order_type="MARKET")
-        self.state.strategy_gross["basis"] += contracts * 2
+        self._trade_pair("CL", "BUY", active_future(self.state), "SELL", contracts)
+
+    def _trade_pair(self, first, first_action, second, second_action, quantity):
+        self.execution.cancel_all_orders()
+        entered = filled(self.execution.place_split_orders(first, first_action, quantity))
+        if not entered:
+            return
+        hedged = filled(self.execution.place_split_orders(second, second_action, entered))
+        if hedged < entered:
+            undo = "SELL" if first_action == "BUY" else "BUY"
+            closed = filled(self.execution.place_split_orders(first, undo, entered - hedged))
+            if closed != entered - hedged:
+                raise TradingHalt("Unmatched basis leg could not be unwound")
+        self.state.strategy_gross["basis"] += hedged * 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GEOGRAPHIC ARB ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TransportEngine:
+class PhysicalEngine:
     def __init__(self, state, execution, storage, config):
-        self.state = state
-        self.execution = execution
-        self.storage = storage
-        self.config = config
-        # Cooldown: don't retry pipelines for N ticks after a failure
-        self._ak_cs_cooldown_until = 0
-        self._cs_nyc_cooldown_until = 0
-        self.COOLDOWN_TICKS = 60  # wait 60 ticks after a 500 error
+        self.state, self.execution, self.storage, self.config = state, execution, storage, config
+        self.jobs = []
 
+    def now(self):
+        return (self.state.period - 1) * self.config.ticks_per_period + self.state.tick
+
+    def start_conversion(self, ticker, source, outputs):
+        asset = next(a for a in _get("/assets") if a["ticker"] == ticker)
+        params = conversion_spec(asset, source, outputs)
+        qty = params["quantity1"]
+        self.execution.cancel_all_orders()
+        if any(self.state.get_position(t) != 0 for t in outputs):
+            return False  # Output accounting must not mix with existing inventory.
+        source_location = {"CL": "CL", "CL-AK": "AK"}[source]
+        missing = max(0, qty - self.state.get_position(source))
+        if missing and self.execution.approved_quantity(source, "BUY", missing) < missing:
+            return False
+        if not self.storage.ensure_storage(source_location, missing):
+            return False
+        for destination, quantity in outputs.items():
+            if destination in ("CL", "CL-NYC"):
+                location = "CL" if destination == "CL" else "NYC"
+                if not self.storage.ensure_storage(location, quantity):
+                    return False
+        if missing and filled(self.execution.place_split_orders(source, "BUY", missing)) != missing:
+            raise TradingHalt("Incomplete conversion input purchase; stopping before leasing")
+        rows = self.execution.refresh_positions()
+        if self.state.get_position(source) < qty:
+            raise TradingHalt("Conversion input not confirmed")
+        # Check the final physical inventory against the same live weighted limits.
+        projected = [dict(r) for r in rows]
+        next(r for r in projected if r["ticker"] == source)["position"] -= qty
+        limits = _get("/limits")
+        for destination, quantity in outputs.items():
+            if not risk_allows(projected, limits, [], destination, "BUY", quantity):
+                raise TradingHalt("Conversion output would breach portfolio limits")
+            next(r for r in projected if r["ticker"] == destination)["position"] += quantity
+        lease = _post("/leases", {"ticker": ticker})
+        if not isinstance(lease, dict) or "id" not in lease:
+            CLIENT.uncertain_write = True
+            raise TradingHalt("Unresolved lease creation")
+        job = {"id": lease["id"], "ticker": ticker, "outputs": dict(outputs),
+               "due": self.now() + int(asset["ticks_per_conversion"]) + 1,
+               "confirmed": False, "released": False}
+        self.jobs.append(job)
+        self.state.conversion_outputs.update(outputs)
+        if ticker == "CL-REFINERY":
+            self.state.refinery_lease_id = lease["id"]
+        else:
+            self.state.active_pipelines.append(lease["id"])
+        _post(f"/leases/{lease['id']}", params)
+        job["confirmed"] = True
+        self.execution.refresh_positions()
+        print(f"  [PHYSICAL] {ticker}: {qty} {source}; expected outputs {outputs}")
+        return True
+
+    def complete(self):
+        for job in list(self.jobs):
+            if not job["confirmed"] or self.now() < job["due"]:
+                continue
+            self.execution.refresh_positions()
+            if not job["released"]:
+                if any(self.state.get_position(t) < q for t, q in job["outputs"].items()):
+                    continue  # Elapsed time alone does not establish output arrival.
+                _delete(f"/leases/{job['id']}")
+                job["released"] = True
+            for ticker, remaining in list(job["outputs"].items()):
+                done = filled(self.execution.place_split_orders(ticker, "SELL", remaining, reduce_only=True))
+                job["outputs"][ticker] -= done
+            if any(job["outputs"].values()):
+                continue
+            self.jobs.remove(job)
+            self.state.conversion_outputs.difference_update(job["outputs"])
+            if job["ticker"] == "CL-REFINERY":
+                self.state.refinery_lease_id = None
+            else:
+                self.state.active_pipelines.remove(job["id"])
+        self.storage.release_empty_storage()
+
+    def busy(self):
+        return bool(self.state.active_pipelines or self.state.refinery_lease_id is not None)
+
+
+class TransportEngine(PhysicalEngine):
     def evaluate(self):
-        tick = self.state.tick
-        if any(abs(tick - t) <= self.config.transport_eia_blackout
-               for t in self.config.eia_ticks):
+        if self.busy():
             return
-        if tick >= self.config.wind_down_start:
-            return
-        if tick >= self._ak_cs_cooldown_until:
-            self._check_ak_to_cushing()
-        if tick >= self._cs_nyc_cooldown_until:
-            self._check_cushing_to_nyc()
-
-    def _check_ak_to_cushing(self):
-        cl_bid, _, cl_last = self.state.get_price("CL")
-        _, ak_ask, ak_last = self.state.get_price("CL-AK")
-        if not all([cl_last, ak_last]):
-            return
-
-        spread = cl_last - ak_last
-        breakeven = self.config.ak_cs_breakeven()
-        required = breakeven + self.config.ak_cs_buffer
-        if spread < required:
-            return
-
-        contracts = 10
-        if (self.state.available_gross("transport") < contracts * 2 or
-                self.state.available_net_buy("CL-AK") < contracts):
-            return
-
-        profit = (spread - breakeven) * 10000
-        print(f"  [TRANSPORT] AK->CS spread=${spread:.2f} (need ${required:.2f}), "
-              f"est profit=${profit:.0f}")
-
-        # Lease pipeline FIRST — if this fails, don't buy crude or lease storage
-        try:
-            lease = _post("/leases", params={"ticker": "AK-CS-PIPE"})
-            lease_id = lease["id"]
-        except Exception as e:
-            print(f"  [ERR] AK-CS pipeline lease failed: {e}")
-            self._ak_cs_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
-            return
-
-        if not self.storage.ensure_storage("AK", contracts):
-            return
-        self.execution.place_split_orders("CL-AK", "BUY", contracts,
-                                          order_type="MARKET")
-        try:
-            _post(f"/leases/{lease_id}", params={"quantity": contracts})
-            self.state.active_pipelines.append(
-                (lease_id, self.state.tick, "AK-CS-PIPE", contracts))
-            self.state.strategy_gross["transport"] += contracts
-            print(f"  [TRANSPORT] AK->CS pipeline started")
-        except Exception as e:
-            print(f"  [ERR] AK-CS pipeline use: {e}")
-            self._ak_cs_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
-
-    def _check_cushing_to_nyc(self):
-        _, _, cl_last = self.state.get_price("CL")
-        nyc_bid, _, nyc_last = self.state.get_price("CL-NYC")
-        if not all([cl_last, nyc_last]):
-            return
-
-        spread = nyc_last - cl_last
-        breakeven = self.config.cs_nyc_breakeven()
-        required = breakeven + self.config.cs_nyc_buffer
-        if spread < required:
-            return
-
-        held_cl = self.state.get_position("CL")
-        contracts = min(10, held_cl)
-        if contracts <= 0 or self.state.available_gross("transport") < contracts:
-            return
-
-        profit = (spread - breakeven) * 10000
-        print(f"  [TRANSPORT] CS->NYC spread=${spread:.2f} (need ${required:.2f}), "
-              f"est profit=${profit:.0f}")
-
-        # Lease pipeline FIRST
-        try:
-            lease = _post("/leases", params={"ticker": "CS-NYC-PIPE"})
-            lease_id = lease["id"]
-        except Exception as e:
-            print(f"  [ERR] CS-NYC pipeline lease failed: {e}")
-            self._cs_nyc_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
-            return
-
-        if not self.storage.ensure_storage("NYC", contracts):
-            return
-        try:
-            _post(f"/leases/{lease_id}", params={"quantity": contracts})
-            self.state.active_pipelines.append(
-                (lease_id, self.state.tick, "CS-NYC-PIPE", contracts))
-            self.state.strategy_gross["transport"] += contracts
-            print(f"  [TRANSPORT] CS->NYC pipeline started")
-        except Exception as e:
-            print(f"  [ERR] CS-NYC pipeline use: {e}")
-            self._cs_nyc_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
+        for ticker, source, destination, tanks, buffer in (
+            ("AK-CS-PIPE", "CL-AK", "CL", ("AK-STORAGE", "CL-STORAGE"), self.config.ak_cs_buffer),
+            ("CS-NYC-PIPE", "CL", "CL-NYC", ("CL-STORAGE", "NYC-STORAGE"), self.config.cs_nyc_buffer),
+        ):
+            asset = self.config.raw_assets.get(ticker, {})
+            if not asset.get("is_available", False) or asset.get("available_quantity", 0) < 1:
+                continue
+            if self.state.tick + self.config.get_transfer_sec(ticker) + 15 >= self.config.wind_down_start:
+                continue
+            _, ask, _ = self.state.get_price(source)
+            bid, _, _ = self.state.get_price(destination)
+            if not ask or not bid:
+                continue
+            # Include both tanks for two billing intervals, fees and price buffer.
+            costs = self.config.get_asset_cost(ticker) + 2 * sum(self.config.get_asset_cost(t) for t in tanks)
+            net = (bid - ask - buffer) * 10000 - costs - 20 * self.config.fee_per_contract
+            if net > 0 and self.start_conversion(ticker, source, {destination: 10}):
+                break
 
     def check_pipeline_completions(self):
-        tick = self.state.tick
-        completed = []
-        for i, (lease_id, start_tick, pipe, qty) in enumerate(
-                self.state.active_pipelines):
-            xfer_time = self.config.get_transfer_sec(pipe)
-            if tick - start_tick >= xfer_time + 1:
-                completed.append(i)
-                if pipe == "AK-CS-PIPE":
-                    self.execution.place_split_orders("CL", "SELL", qty,
-                                                     order_type="MARKET")
-                    print(f"  [TRANSPORT] AK->CS complete, selling {qty} CL")
-                elif pipe == "CS-NYC-PIPE":
-                    self.execution.place_split_orders("CL-NYC", "SELL", qty,
-                                                     order_type="MARKET")
-                    print(f"  [TRANSPORT] CS->NYC complete, selling {qty} CL-NYC")
-                self.state.strategy_gross["transport"] -= qty
-        for i in reversed(completed):
-            self.state.active_pipelines.pop(i)
+        self.complete()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CRACK SPREAD ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class CrackEngine:
-    def __init__(self, state, execution, storage, config):
-        self.state = state
-        self.execution = execution
-        self.storage = storage
-        self.config = config
-
+class CrackEngine(PhysicalEngine):
     def evaluate(self):
-        tick = self.state.tick
-        refinery_time = self.config.get_transfer_sec("CL-REFINERY")
-        if tick >= self.config.ticks_per_period - refinery_time - 15:
+        if self.busy():
             return
-        if self.state.refinery_lease_id is not None:
+        asset = self.config.raw_assets.get("CL-REFINERY", {})
+        if not asset.get("is_available", False) or asset.get("available_quantity", 0) < 1:
             return
-
-        _, _, cl_last = self.state.get_price("CL")
-        _, _, rb_last = self.state.get_price("RB")
-        _, _, ho_last = self.state.get_price("HO")
-        if not all([cl_last, rb_last, ho_last]):
+        if self.state.tick + self.config.get_transfer_sec("CL-REFINERY") + 15 >= self.config.wind_down_start:
             return
-
-        cl_size = self.config.get_contract_size("CL")
-        rb_size = self.config.get_contract_size("RB")
-        ho_size = self.config.get_contract_size("HO")
-
-        # 3:2:1 crack
-        revenue = rb_last * 2 * rb_size + ho_last * 1 * ho_size
-        cost = cl_last * 3 * cl_size
-        refinery_cost = self.config.get_asset_cost("CL-REFINERY")
-        net_profit = revenue - cost - refinery_cost - (7 * self.config.fee_per_contract)
-
-        if net_profit < self.config.crack_min_profit:
+        _, cl_ask, _ = self.state.get_price("CL")
+        rb_bid, _, _ = self.state.get_price("RB")
+        ho_bid, _, _ = self.state.get_price("HO")
+        if not all((cl_ask, rb_bid, ho_bid)):
             return
-        if self.state.get_position("CL") < 3:
-            return
-        if self.state.available_gross("crack") < 3:
-            return
-
-        print(f"  [CRACK] Profitable! revenue=${revenue:.0f} cost=${cost:.0f} "
-              f"net=${net_profit:.0f}")
-        try:
-            lease = _post("/leases", params={"ticker": "CL-REFINERY"})
-            lease_id = lease["id"]
-            _post(f"/leases/{lease_id}", params={"quantity": 3})
-            self.state.refinery_lease_id = lease_id
-            self.state.refinery_start_tick = tick
-            self.state.strategy_gross["crack"] += 3
-            print(f"  [CRACK] Refinery started ({refinery_time} sec)")
-        except Exception as e:
-            print(f"  [ERR] refinery: {e}")
+        revenue = rb_bid * 20 * self.config.get_contract_size("RB") + ho_bid * 10 * self.config.get_contract_size("HO")
+        costs = cl_ask * 30 * self.config.get_contract_size("CL")
+        costs += self.config.get_asset_cost("CL-REFINERY") + 6 * self.config.get_asset_cost("CL-STORAGE")
+        costs += 60 * self.config.fee_per_contract
+        if revenue - costs > self.config.crack_min_profit:
+            self.start_conversion("CL-REFINERY", "CL", {"RB": 20, "HO": 10})
 
     def check_refinery_completion(self):
-        if self.state.refinery_lease_id is None:
-            return
-        refinery_time = self.config.get_transfer_sec("CL-REFINERY")
-        if self.state.tick - self.state.refinery_start_tick >= refinery_time + 1:
-            try:
-                _delete(f"/leases/{self.state.refinery_lease_id}")
-                print(f"  [CRACK] Refinery released")
-            except Exception as e:
-                print(f"  [ERR] refinery release: {e}")
+        self.complete()
 
-            self.state.refinery_lease_id = None
-            self.state.refinery_start_tick = None
-
-            rb_pos = self.state.get_position("RB")
-            ho_pos = self.state.get_position("HO")
-            if rb_pos > 0:
-                self.execution.place_split_orders("RB", "SELL", rb_pos,
-                                                  order_type="MARKET")
-            if ho_pos > 0:
-                self.execution.place_split_orders("HO", "SELL", ho_pos,
-                                                  order_type="MARKET")
-            self.state.strategy_gross["crack"] -= 3
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MARKET MAKING ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class MarketMaker:
     def __init__(self, state, execution, config):
@@ -1372,7 +1266,7 @@ class MarketMaker:
             return
         # Skip MM when EIA is holding large directional positions —
         # we don't want to provide liquidity against our own conviction trade
-        net_pos = self.state.get_position("CL-1F")
+        net_pos = self.state.get_position(active_future(self.state))
         eia_active = self.state.strategy_gross.get("eia", 0) > 10
         if eia_active:
             return
@@ -1380,7 +1274,7 @@ class MarketMaker:
             return
 
         # Use market mid as anchor, blended with fair value model
-        market_mid = self.state.get_mid("CL-1F")
+        market_mid = self.state.get_mid(active_future(self.state))
         fair = self.state.fair_value
         if market_mid and fair:
             # Blend: 70% market, 30% model (model may be stale if joined mid-heat)
@@ -1400,11 +1294,12 @@ class MarketMaker:
         elif net_pos < -self.config.mm_max_net // 2:
             ask_price += 0.02
 
-        print(f"  [MM] Quoting CL-1F: bid=${bid_price:.2f} ask=${ask_price:.2f} "
+        self.execution.cancel_all_orders()
+        print(f"  [MM] Quoting {active_future(self.state)}: bid=${bid_price:.2f} ask=${ask_price:.2f} "
               f"(anchor=${anchor:.2f}, net={net_pos})")
-        self.execution.place_order("CL-1F", "BUY", self.config.mm_size,
+        self.execution.place_order(active_future(self.state), "BUY", self.config.mm_size,
                                    price=bid_price, order_type="LIMIT")
-        self.execution.place_order("CL-1F", "SELL", self.config.mm_size,
+        self.execution.place_order(active_future(self.state), "SELL", self.config.mm_size,
                                    price=ask_price, order_type="LIMIT")
         self.last_quote_tick = tick
         self.active = True
@@ -1423,22 +1318,21 @@ class RiskManager:
         self.wind_down_started = False
 
     def process_scheduled_exits(self):
-        tick = self.state.tick
         remaining = []
-        for exit_info in self.state.scheduled_exits:
-            exit_tick, ticker, action, quantity, strategy = exit_info
-            if tick >= exit_tick:
-                if action == "SELL":
-                    quantity = min(quantity, self.state.available_net_sell(ticker))
-                else:
-                    quantity = min(quantity, self.state.available_net_buy(ticker))
-                if quantity > 0:
-                    self.execution.place_split_orders(ticker, action, quantity,
-                                                     order_type="MARKET")
-                    self.state.strategy_gross[strategy] = max(
-                        0, self.state.strategy_gross[strategy] - quantity)
-            else:
-                remaining.append(exit_info)
+        if any(self.state.tick >= e[0] for e in self.state.scheduled_exits):
+            self.execution.cancel_all_orders()
+        self.execution.refresh_positions()
+        for exit_tick, ticker, action, quantity, strategy in self.state.scheduled_exits:
+            if self.state.tick < exit_tick or ticker in self.state.conversion_outputs:
+                remaining.append((exit_tick, ticker, action, quantity, strategy))
+                continue
+            pos = self.state.get_position(ticker)
+            reducible = max(0, pos if action == "SELL" else -pos)
+            quantity = min(quantity, reducible)
+            done = filled(self.execution.place_split_orders(ticker, action, quantity, reduce_only=True)) if quantity else 0
+            self.state.strategy_gross[strategy] = max(0, self.state.strategy_gross[strategy] - done)
+            if done < quantity:
+                remaining.append((self.state.tick + 1, ticker, action, quantity - done, strategy))
         self.state.scheduled_exits = remaining
 
     def check_wind_down(self):
@@ -1453,16 +1347,21 @@ class RiskManager:
         print(f"\n  [RISK] Wind-down started at tick {self.state.tick}")
         self.execution.cancel_all_orders()
         self.state.scheduled_exits.clear()
+        self._emergency_flatten()
 
     def _emergency_flatten(self):
+        self.execution.cancel_all_orders()
+        self.execution.refresh_positions()
         for ticker in self.config.tickers:
+            if ticker in self.state.conversion_outputs:
+                continue
             pos = self.state.get_position(ticker)
             if pos > 0:
                 self.execution.place_split_orders(ticker, "SELL", pos,
-                                                  order_type="MARKET")
+                                                  order_type="MARKET", reduce_only=True)
             elif pos < 0 and self.config.is_shortable(ticker):
                 self.execution.place_split_orders(ticker, "BUY", abs(pos),
-                                                  order_type="MARKET")
+                                                  order_type="MARKET", reduce_only=True)
         self.storage.release_empty_storage()
 
     def pre_eia_cleanup(self, tick):
@@ -1581,7 +1480,7 @@ class Orchestrator:
     def _tune_liquidity(self):
         """Adjust MM spread and order aggressiveness based on observed liquidity."""
         # Use CL-1F spreads as the primary liquidity signal
-        spreads = self.observed_spreads.get("CL-1F", [])
+        spreads = self.observed_spreads.get(active_future(self.state), [])
         if len(spreads) < 5:
             return
 
@@ -1589,7 +1488,7 @@ class Orchestrator:
         recent = spreads[-30:]
         avg_spread = sum(recent) / len(recent)
 
-        depths = self.observed_depths.get("CL-1F", [])
+        depths = self.observed_depths.get(active_future(self.state), [])
         avg_depth = (sum(depths[-30:]) / len(depths[-30:])) if len(depths) >= 5 else 50
 
         # MM spread: set to ~40% of observed spread (capture spread while filling)
@@ -1737,7 +1636,7 @@ class RunLogger:
     """Logs all bot activity to file and saves post-run analytics."""
 
     def __init__(self):
-        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.run_dir = os.path.join("runs", self.run_id)
         os.makedirs(self.run_dir, exist_ok=True)
 
@@ -1840,243 +1739,213 @@ class RunLogger:
     def close(self):
         self._events_file.close()
         self._nlv_file.close()
+        for handler in list(self.logger.handlers):
+            handler.close()
+            self.logger.removeHandler(handler)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    log = RunLogger()
-    log.info("=" * 60)
-    log.info("  COM5 COMPETITION BOT — ADAPTIVE CONFIG")
-    log.info(f"  Run ID: {log.run_id}")
-    log.info(f"  Output: {log.run_dir}")
-    log.info("=" * 60)
-
-    config = CaseConfig()
-
-    log.info("\nWaiting for case to become ACTIVE...")
-    while True:
-        try:
+def shutdown(state, execution, storage, transport, crack, seconds=60):
+    """Best effort only: report residual exposure instead of claiming flatness."""
+    deadline = time.monotonic() + seconds
+    failures = []
+    try:
+        execution.cancel_all_orders()
+        while time.monotonic() < deadline:
             case = _get("/case")
-            if case.get("status") == "ACTIVE":
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-    config.discover()
-    log.save_config(config)
-
-    # Drain existing news backlog — don't trade on stale data from before we started
-    try:
-        old_news = _get("/news", {"since": 0})
-        if old_news:
-            max_old_id = max(n["news_id"] for n in old_news)
-            log.info(f"  [STARTUP] Skipping {len(old_news)} historical news items "
-                     f"(last_id={max_old_id})")
-        else:
-            max_old_id = 0
-    except Exception:
-        max_old_id = 0
-
-    state = StateManager(config)
-    state.last_news_id = max_old_id  # skip all pre-existing news
-    execution = ExecutionEngine(state, config)
-    storage = StorageManager(state, config)
-    orchestrator = Orchestrator(state, config)
-
-    eia_engine = EIAEngine(state, execution, storage, config)
-    news_engine = NewsEngine(state, execution, config)
-    basis_engine = BasisEngine(state, execution, storage, config)
-    transport_engine = TransportEngine(state, execution, storage, config)
-    crack_engine = CrackEngine(state, execution, storage, config)
-    market_maker = MarketMaker(state, execution, config)
-    risk_manager = RiskManager(state, execution, storage, config)
-
-    last_period = 0
-    prev_cl_last = None
-    last_processed_tick = -1
-    last_processed_period = -1
-
-    try:
-        while True:
-            try:
-                case = _get("/case")
-            except Exception as e:
-                log.error(f"API unreachable: {e}")
-                time.sleep(2)
-                continue
-
-            if case.get("status") != "ACTIVE":
-                if state.status == "ACTIVE":
-                    # Period ended — check if ALL periods are done
-                    if state.period >= config.total_periods:
-                        log.info("\nAll periods complete. Case ended.")
-                        break
-                    log.info(f"\nPeriod {state.period} ended. "
-                             f"Waiting for next period...")
-                    state.status = case.get("status", "STOPPED")
-                time.sleep(0.5)
-                continue
-
             state.update_from_case(case)
-            tick = state.tick
-            period = state.period
+            execution.refresh_positions()
+            if case.get("status") != "ACTIVE":
+                break
+            transport.complete()
+            crack.complete()
+            # Do not consume outputs still belonging to a pending conversion job.
+            reserved = {t for engine in (transport, crack) for job in engine.jobs for t in job["outputs"]}
+            for ticker, position in list(state.positions.items()):
+                if position and ticker not in reserved:
+                    execution.place_split_orders(ticker, "SELL" if position > 0 else "BUY", abs(position), reduce_only=True)
+            execution.refresh_positions()
+            storage.release_empty_storage()
+            if not any(state.positions.values()) and not transport.jobs and not crack.jobs:
+                break
+            time.sleep(.2)
+    except (Exception, TradingHalt) as exc:
+        failures.append(str(exc))
+    except KeyboardInterrupt:
+        failures.append("Cleanup interrupted a second time")
+    # These reads never imply that a failed cancellation succeeded.
+    report = {"positions": dict(state.positions), "open_orders": None, "leases": None,
+              "errors": failures, "flat": False, "uncertain_write": bool(getattr(CLIENT, "uncertain_write", False))}
+    try:
+        execution.refresh_positions()
+        report["positions"] = dict(state.positions)
+        report["open_orders"] = _get("/orders", {"status": "OPEN"})
+        report["leases"] = _get("/leases")
+        state.nlv = _get("/trader").get("nlv", state.nlv)
+        report["flat"] = not report["uncertain_write"] and not any(state.positions.values()) and not report["open_orders"] and not report["leases"]
+    except (Exception, TradingHalt, KeyboardInterrupt) as exc:
+        report["errors"].append(f"Final reconciliation failed: {exc}")
+    print("SHUTDOWN: " + json.dumps(report, default=str))
+    return report
 
-            # Skip if we already processed this tick (loop faster than ticks)
-            if tick == last_processed_tick and period == last_processed_period:
-                time.sleep(0.05)
+
+def ensure_clean_account():
+    positions = _get("/securities")
+    if any(r["position"] for r in positions) or _get("/orders", {"status": "OPEN"}) or _get("/leases"):
+        raise TradingHalt("Start with no positions, open orders or leases. Existing account left untouched.")
+
+
+def run_live(config):
+    log = None
+    state = None
+    owned = False
+    exit_code = 0
+    try:
+        ensure_clean_account()
+        print("Waiting for ACTIVE case. Ctrl+C exits without trading.")
+        while _get("/case").get("status") != "ACTIVE":
+            time.sleep(.5)
+        config.discover()
+        ensure_clean_account()
+        state = StateManager(config)
+        state.update_from_case(_get("/case"))
+        state.update_from_securities(_get("/securities"))
+        state.nlv = _get("/trader").get("nlv", 0)
+        old_news = _get("/news", {"since": 0})
+        state.last_news_id = max((n["news_id"] for n in old_news), default=0)
+        execution = ExecutionEngine(state, config)
+        storage = StorageManager(state, config)
+        transport = TransportEngine(state, execution, storage, config)
+        crack = CrackEngine(state, execution, storage, config)
+        eia = EIAEngine(state, execution, storage, config)
+        news_engine = NewsEngine(state, execution, config)
+        basis = BasisEngine(state, execution, storage, config)
+        mm = MarketMaker(state, execution, config)
+        risk = RiskManager(state, execution, storage, config)
+        orchestrator = Orchestrator(state, config)
+        log = RunLogger()
+        execution.logger = log
+        log.save_config(config)
+        owned = True
+        last_time = None
+        last_period = state.period
+        prev_price = None
+        while True:
+            case = _get("/case")
+            if case.get("status") != "ACTIVE":
+                if state.period >= config.total_periods:
+                    break
+                time.sleep(.5)
                 continue
-            last_processed_tick = tick
-            last_processed_period = period
-
+            state.update_from_case(case)
+            tick, period = state.tick, state.period
+            if last_time == (period, tick):
+                time.sleep(.05)
+                continue
+            last_time = (period, tick)
             if period != last_period:
-                risk_manager.on_period_end()
+                risk.on_period_end()
+                eia.processed_news_ids.clear()
                 last_period = period
-
-            # ── 1. NEWS (highest priority) ──────────────────────────
-            try:
-                news = _get("/news", {"since": state.last_news_id})
-                if news:
-                    state.last_news_id = max(n["news_id"] for n in news)
-                    for n in news:
-                        headline = n.get("headline", "")
-                        is_eia = eia_engine.is_eia_report(n)
-                        log.info(f"  [P{period} T{tick}] NEWS: {headline}")
-                        log.debug(f"    news_id={n.get('news_id')} "
-                                  f"is_eia={is_eia} "
-                                  f"body={n.get('body', '')[:200]}")
-                        log.event("news", period, tick,
-                                  headline=headline, is_eia=is_eia,
-                                  body=n.get("body", "")[:500])
-                        if is_eia:
-                            cl_mid = state.get_mid("CL")
-                            prev_impacts = len(state.eia_calculated_impacts)
-                            eia_engine.process(n)
-                            if len(state.eia_calculated_impacts) > prev_impacts:
-                                orchestrator.observe_eia_pre(
-                                    tick, cl_mid,
-                                    state.eia_calculated_impacts[-1])
-                            log.event("eia_trade", period, tick,
-                                      fair_value=state.fair_value,
-                                      eia_count=state.eia_count)
-                        else:
-                            news_engine.process(n)
-            except Exception as e:
-                log.error(f"  [ERR] news poll: {e}")
-
-            # ── 2. MARKET DATA ──────────────────────────────────────
-            try:
-                securities = _get("/securities")
-                state.update_from_securities(securities)
-
-                # Drift fair value toward market (handles mid-heat join)
+            # No signal can use the previous tick's inventory or prices.
+            execution.refresh_positions()
+            state.nlv = _get("/trader").get("nlv", state.nlv)
+            transport.complete()
+            crack.complete()
+            risk.process_scheduled_exits()
+            risk.pre_eia_cleanup(tick)
+            if tick >= config.wind_down_start:
+                risk.check_wind_down()
+                # Keep trying exits during wind-down, with no new news entries.
+                risk._emergency_flatten()
+            else:
                 state.drift_fair_value()
-
-                # Feed orchestrator: volatility observation
-                cl_last = state.securities.get("CL", {}).get("last")
-                orchestrator.observe_price(prev_cl_last, cl_last)
-                prev_cl_last = cl_last
-
-                # Feed orchestrator: check EIA post-reaction (~10 ticks after)
-                cl_mid = state.get_mid("CL")
-                if cl_mid:
-                    for eia_tick in list(orchestrator.eia_pre_prices.keys()):
-                        if tick - eia_tick >= 10:
-                            orchestrator.observe_eia_post(eia_tick, cl_mid)
-            except Exception as e:
-                log.error(f"  [ERR] securities: {e}")
-
-            # ── 3. SCHEDULED EXITS ──────────────────────────────────
-            risk_manager.process_scheduled_exits()
-
-            # ── 4. PRE-EIA CLEANUP ──────────────────────────────────
-            risk_manager.pre_eia_cleanup(tick)
-
-            # ── 5. ASSET COMPLETION CHECKS ──────────────────────────
-            crack_engine.check_refinery_completion()
-            transport_engine.check_pipeline_completions()
-
-            # ── 6. STRATEGY ENGINES ─────────────────────────────────
-            near_eia = any(abs(tick - t) <= config.eia_pre_cancel_buffer
-                          for t in config.eia_ticks)
-            in_wind_down = tick >= config.wind_down_start
-
-            if not near_eia and not in_wind_down:
-                basis_engine.evaluate()
-                transport_engine.evaluate()
-                crack_engine.evaluate()
-                market_maker.update()
-
-            # ── 7. WIND-DOWN ────────────────────────────────────────
-            risk_manager.check_wind_down()
-
-            # ── 8. ORCHESTRATOR TUNING ──────────────────────────────
-            orchestrator.tune(tick)
-            if orchestrator.adjustments_made:
-                log.event("orchestrator_tune", period, tick,
-                          adjustments=list(orchestrator.adjustments_made),
-                          aggression=orchestrator.aggression)
-                orchestrator.adjustments_made.clear()
-
-            # ── 9. CONFIG REFRESH + RECONCILIATION ──────────────────
+                price = state.get_mid("CL")
+                orchestrator.observe_price(prev_price, price)
+                prev_price = price
+                for item in _get("/news", {"since": state.last_news_id}):
+                    log.event("news", period, tick, news=item)
+                    if eia.is_eia_report(item):
+                        before = len(state.eia_calculated_impacts)
+                        pre_price = state.get_mid("CL")
+                        eia.process(item)
+                        if len(state.eia_calculated_impacts) > before and pre_price:
+                            orchestrator.observe_eia_pre(tick, pre_price, state.eia_calculated_impacts[-1])
+                    else:
+                        news_engine.process(item)
+                    state.last_news_id = max(state.last_news_id, item["news_id"])
+                near_eia = any(abs(tick - t) <= config.eia_pre_cancel_buffer for t in config.eia_ticks)
+                if not near_eia:
+                    if config.physical_enabled and not transport.busy():
+                        basis.evaluate()
+                        transport.evaluate()
+                        crack.evaluate()
+                    mm.update()
+                for event_tick in list(orchestrator.eia_pre_prices):
+                    if tick - event_tick >= 10 and price:
+                        orchestrator.observe_eia_post(event_tick, price)
+                if tick % config.reconcile_interval == 0:
+                    orchestrator.observe_book(active_future(state), _get("/securities/book", {"ticker": active_future(state)}))
+                orchestrator.tune(tick)
             if tick % config.reconcile_interval == 0:
                 config.refresh()
-                state.reconcile()
-
-                # Feed orchestrator: order book observation for liquidity
-                try:
-                    for ob_ticker in ["CL-1F", "CL"]:
-                        book = _get("/securities/book",
-                                    {"ticker": ob_ticker})
-                        orchestrator.observe_book(ob_ticker, book)
-                    # Also observe geographic spreads for budget tuning
-                    cl_p = state.securities.get("CL", {}).get("last")
-                    ak_p = state.securities.get("CL-AK", {}).get("last")
-                    nyc_p = state.securities.get("CL-NYC", {}).get("last")
-                    if cl_p and ak_p:
-                        orchestrator.observed_spreads["CL-AK"].append(
-                            cl_p - ak_p)
-                    if cl_p and nyc_p:
-                        orchestrator.observed_spreads["CL-NYC"].append(
-                            nyc_p - cl_p)
-                except Exception as e:
-                    log.debug(f"  [ERR] book observation: {e}")
-
-            # ── 10. STATUS + LOGGING ────────────────────────────────
-            if tick % 30 == 0:
-                gross = state.total_gross()
-                fv = state.fair_value
-                cl_last = state.securities.get("CL", {}).get("last")
-                fv_str = f"${fv:.2f}" if fv else "N/A"
-                agg = orchestrator.aggression
-                log.info(f"  [P{period} T{tick:>3}] NLV=${state.nlv:>10,.0f} "
-                         f"gross={gross}/{config.gross_limit} "
-                         f"FV={fv_str} CL=${cl_last} agg={agg:.1f}")
-                log.snapshot(period, tick, state.nlv, gross, fv, cl_last)
-
-            # ── 11. PACING ──────────────────────────────────────────
+                storage.release_empty_storage()
+            log.snapshot(period, tick, state.nlv, state.total_gross(), state.fair_value, state.get_mid("CL"))
             time.sleep(config.loop_sleep)
-
     except KeyboardInterrupt:
-        log.info("\n\nBot stopped by user.")
-    except Exception as e:
-        log.error(f"\n[FATAL] {e}")
-        import traceback
-        traceback.print_exc()
+        print("Stop requested. Attempting account cleanup; Ctrl+C again aborts cleanup.")
+    except (Exception, TradingHalt) as exc:
+        exit_code = 1
+        print(f"STOP: {exc}")
+        if log:
+            log.error(f"STOP: {exc}")
+    finally:
+        if owned:
+            report = shutdown(state, execution, storage, transport, crack)
+            if not report["flat"]:
+                exit_code = 1
+            log.event("shutdown", state.period, state.tick, **report)
+            log.save_summary(state, config)
+        if log:
+            log.close()
+    return exit_code
 
-    # ── Post-run analytics ──────────────────────────────────────────
-    log.info(f"\nFinal NLV: ${state.nlv:,.0f}")
-    log.info(f"EIA reports processed: {state.eia_count}")
-    log.info(f"Fair value at end: {state.fair_value}")
-    log.info(f"EIA efficiency observations: {orchestrator.eia_efficiency}")
-    log.info(f"Final aggression: {orchestrator.aggression}")
-    log.save_summary(state, config)
-    log.close()
-    print(f"\nFull run logs: {log.run_dir}/")
+
+def main(argv=None):
+    global CLIENT
+    parser = argparse.ArgumentParser(description="Matthew Lones COM5 bot with corrected execution and shutdown")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--live", action="store_true", help="Enable orders and asset leases")
+    mode.add_argument("--check", action="store_true", help="Read configuration once; no trading (default)")
+    mode.add_argument("--dry-run", action="store_true", help="Alias for read-only --check; does not simulate fills")
+    parser.add_argument("--futures-only", action="store_true", help="Run EIA/news/MM futures; disable spot, basis and physical assets")
+    args = parser.parse_args(argv)
+    if not API_KEY:
+        parser.error("Set RIT_API_KEY or API_KEY in com5_template.py to your own RIT Client key")
+    CLIENT = Client(BASE, HEADERS, live=args.live)
+    config = CaseConfig()
+    config.physical_enabled = not args.futures_only
+    if not args.live:
+        config.discover()
+        case = _get("/case")
+        print(f"READ-ONLY CHECK: status={case.get('status')} period={case.get('period')} tick={case.get('tick')}")
+        print("No orders or leases sent. A read-only check does not verify API order permissions.")
+        return
+    lock = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        parser.error(".bot.lock exists. Confirm no other bot is running before removing a stale lock.")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(os.getpid()))
+        return run_live(config)
+    finally:
+        os.unlink(lock)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

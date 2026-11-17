@@ -1,47 +1,39 @@
-# Running Matthew Lones' COM5 bot
+# Setup and behavior after the fixes
 
-Reviewed November 17, 2026. This repository contains only the eight original files from MatthewLones/QUANTTxCOM5 at commit e260722ad2adfbc862c963c2e634b70acdb3c5a4, plus this guide and provenance metadata. Original code is unchanged. Syntax checks pass; no live run or profit result has been verified here.
+Updated November 17, 2026. Use bot.py as the entrypoint; com5_template.py supplies its connection settings. This is now a modified derivative, not an unchanged upstream snapshot. See README.md for commands and CHANGES.md for the changes.
 
-## Can I just run it?
+## What you must configure
 
-Not as a fully validated plug-and-play bot. The Python entrypoint is bot.py, but you must configure your RIT connection, and the physical-asset API calls need fixes or confirmation before using the full strategy. This is more specific than the earlier collection's general compatibility caveat.
+Install requirements.txt and set your own RIT_API_KEY environment variable. Alternatively, edit API_KEY locally in com5_template.py, but do not commit your key. RIT_BASE_URL defaults to http://localhost:9999/v1. The original template's external competition server address is historical; use your instructor's server.
 
-## Setup and entrypoint
+Run `python bot.py --check` first. It performs GET requests only, discovers the case, and validates supported physical conversion metadata. It does not prove API order entry is enabled. Then `python bot.py --live` starts trading when the case is ACTIVE. `--futures-only` can be supplied to both commands to test the futures components separately. Starting without --live cannot place orders or acquire leases through bot.py.
 
-Keep all project files together on the computer running the RIT Client. Replace API_KEY in com5_template.py with the key from YOUR client. BASE defaults to http://localhost:9999/v1; change it if your client uses another port. The server address in the original template's header is the author's event setup, not an instruction to join that server. Use your course's assigned RIT server and COM5 case. Python API order entry must be enabled for the session.
+## Scheduled exits are still part of the strategy
 
-The only third-party Python dependency is requests:
+EIA trades retain their tiered exits: initially 50% after 10 ticks, 30% after 30 ticks, and the rest after 60 ticks, with integer rounding. Adaptive tuning can change these delays. News trades retain their initial 70%/30% exits at 15/30 ticks. The quantities now come from confirmed fills, and any unfilled exit remainder stays scheduled. An exit only reduces an existing position; it cannot accidentally open the opposite position.
 
-```powershell
-python -m pip install requests
-```
+End-of-period wind-down begins 40 ticks before expiry (tick 560 in a 600-tick period), blocks new news/strategy entries and repeatedly attempts closeout. The physical engines stop starting conversions sufficiently earlier. Period 2 uses CL-2F instead of submitting CL-1F orders.
 
-Once configured and the compatibility issues below are resolved, the launch command, from this folder, is:
+Ctrl+C is separate from scheduled exits. Previously it stopped the loop without account cleanup. It now triggers a cleanup attempt and records the result. Scheduled exits cannot run after a process has been killed; inspect the account after any forced termination.
 
-```powershell
-python bot.py
-```
+## Physical assets and limits
 
-Run bot.py, not com5_template.py. The template also provides the configuration imported by the bot. There is no implemented --dry-run, --check or --help mode in bot.py; passing those flags does not prevent it from trading. It waits for an ACTIVE case and then runs its strategies automatically. It skips news already present at startup, so start before the first report on a fresh practice account. Do not run another bot or trade manually on the same account during a comparison.
+The supplied case's supported batches are 10 CL-AK -> 10 CL through AK-CS-PIPE; 10 CL -> 10 CL-NYC through CS-NYC-PIPE; and 30 CL -> 20 RB + 10 HO through CL-REFINERY. Quantities are contracts. Their base-unit economics use each security's contract size. Live convert_from/convert_to metadata must match; different conventions cause a clear refusal, not an inferred conversion.
 
-## Findings that matter before a practice run
+The bot uses from1/quantity1 for POST /leases/{id}, and reads containment and ticks_per_conversion rather than confusing total_quantity (number of assets) with storage capacity. It verifies input holdings, reserves destination storage and checks final weighted exposure before conversion. Only one conversion job is opened at a time and destination holdings must initially be zero, so completion accounting is not mixed with unrelated inventory. Conversion records survive a period boundary. Both elapsed time and arrived inventory are required before selling output; empty storage needed by unresolved conversions is retained.
 
-1. **Physical-asset calls do not match the documented API.** In bot.py, the pipeline calls around lines 1194 and 1234 and the refinery call around line 1311 submit only a quantity field to POST /leases/{id}. The official RIT REST 1.0.4 schema requires from1 and quantity1. These paths can fail after a lease is created or crude is purchased. The refinery also assumes a three-contract input; confirm the actual case batch and conversion quantities before changing it. Source: https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml (leases/{id} POST). Fix these calls and confirm units or explicitly disable the physical engines before attempting a full automated run; this original snapshot does neither for you.
+Conversion proceeds are not locked in at entry: destination/product prices can move before completion. Lasting API failure can strand inventory or leases. No code can guarantee cleanup under every server state.
 
-2. **Ctrl+C does not flatten the account.** The KeyboardInterrupt handler near the end of main() logs a stop and writes a summary. It does not cancel orders, close positions or release leases. Its scheduled end-of-period wind-down is a separate mechanism. After stopping, inspect and manage the account in RIT; do not assume it is flat.
+Every order is checked against the server's named limit groups, security weights, current positions and outstanding orders. Exchange-side changes and market fills can still race snapshots; the server remains authoritative. The original aggressive EIA idea remains, but it cannot independently allocate a full net limit to every ticker. Open-order risk is reserved, and rejected/partial orders no longer count as fully executed.
 
-3. **It is aggressive and runs multiple strategies.** EIA, keyword news, futures basis, pipelines, refining and market making are wired into main(). EIA's initial minimum-impact threshold is zero, and its gross allocation can be large; parameters are subsequently retuned. Starting the program is authorization for all enabled engines, not just EIA trading.
+## Execution and logs
 
-4. **Automatic discovery is incomplete.** Despite the header's 'zero hardcoded values' claim, timing, thresholds, EIA impact assumptions and physical conversion logic contain fixed defaults. Limits are represented using a simplified per-ticker scheme. Check the discovered configuration and compare it with your course case; discovery does not prove rule compatibility.
+REST calls have explicit connect/read timeouts. Rate-limit retries are bounded. A timed-out or server-error write is never automatically resubmitted; all engines stop and cleanup is attempted. An uncertain write is explicitly flagged, even if the final snapshot looks flat.
 
-5. **Execution is not fully reconciled.** Requests have no explicit timeout. Split-order placement decrements the requested remaining quantity even if an order returns no result. The main loop handles news before refreshing that tick's securities snapshot, and multiple engines act between refreshes. These are reasons to monitor rejected orders, partial fills and actual account exposure, not evidence of guaranteed losses.
+Market orders are polled for terminal status; unresolved remainder is cancelled and reconciled. Basis hedges match actual first-leg fills and attempt to unwind unmatched quantities. Market-making quotes are cancelled before replacement. This remains a market-order-heavy strategy; slippage, fees and crowded news responses can materially affect profit.
 
-6. **The auxiliary scraper can also act on the account.** data_scraper.py includes an API stress path that cancels orders. Do not launch it blindly alongside the bot. analyze_data.py is an analysis tool, not the trading entrypoint.
+The order and shutdown records are in runs/<run_id>/events.jsonl; server NLV observations are in nlv.csv. bot.log contains explicit logger messages, not a complete transcript of every legacy print statement. Abrupt process termination can prevent the normal summary. data_scraper.py still contains an upstream cancellation stress path, so do not run it blindly alongside the live bot. analyze_data.py is the original data-analysis utility, not the trading entrypoint.
 
-## What gets recorded
+## Validation scope
 
-The bot creates runs/<run_id>/ with bot.log, events.jsonl, nlv.csv, config.json and (after normal shutdown) summary.json. Keep that entire run folder and the official RIT performance report. A crash or interrupt during startup can prevent the usual summary. The author's competition placement is an upstream claim, not an independently verified profit expectation for your class.
-
-## What was changed here
-
-No original algorithm, parameter, credential placeholder or README was changed. UPSTREAM.json records all eight original file hashes and their source URLs. The purpose is to preserve a clean comparison baseline; fixes should be explicitly recorded before testing. Do not commit your personal API key after configuring your local copy.
+35 offline tests passed on Python 3.13 with requests 2.32.5. A mocked live loop opened positions, received Ctrl+C, cancelled/closed exposure and wrote its summary. A mocked physical cycle checked the 30/20/10 quantities, output arrival, sale and lease cleanup. No real RIT server trading or profit measurement has been performed. Start with one supervised practice heat and retain the official performance report.

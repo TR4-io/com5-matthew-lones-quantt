@@ -13,11 +13,12 @@ Usage:  1. Connect to RIT Client (rit.ethansolnik.com:443)
 """
 
 import requests
+import os
 import time
 
 # ── Config ───────────────────────────────────────────────────────────────────
-API_KEY = "1Y71A2ZG" #<-- REPLACE WITH YOUR API KEY FROM RIT CLIENT
-BASE    = "http://localhost:9999/v1"
+API_KEY = os.environ.get("RIT_API_KEY", "")  # Or set your own key here locally.
+BASE = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1")
 HEADERS = {"X-API-Key": API_KEY} #<-- DO NOT CHANGE THIS
 
 # ── COM5 Case Rules ─────────────────────────────────────────────────────────
