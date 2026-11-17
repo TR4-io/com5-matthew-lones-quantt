@@ -1,0 +1,103 @@
+{
+  "repository": "MatthewLones/QUANTTxCOM5",
+  "status": "First comparison candidate; live behavior untested",
+  "summary": "Multi-strategy bot: EIA news, futures basis, transport, refining and market making; includes template, scraper and analysis tools.",
+  "entrypoints": [
+    "bot.py"
+  ],
+  "dependencies": [
+    "requests"
+  ],
+  "config_files": [
+    "com5_template.py"
+  ],
+  "working_directory": ".",
+  "commands": [
+    "python bot.py"
+  ],
+  "notes": [
+    "Set API_KEY and the API base URL in com5_template.py to your own RIT Client values. The bot imports these settings.",
+    "The competition placement stated in its README is an author claim, not independently verified performance.",
+    "com5_template.py is a teaching scaffold. data_scraper.py includes a stress-test path that calls cancel_all; do not assume every scraper mode is read-only."
+  ],
+  "directory": "MatthewLones__QUANTTxCOM5",
+  "commit": "e260722ad2adfbc862c963c2e634b70acdb3c5a4",
+  "url": "https://github.com/MatthewLones/QUANTTxCOM5",
+  "snapshot_url": "https://github.com/MatthewLones/QUANTTxCOM5/tree/e260722ad2adfbc862c963c2e634b70acdb3c5a4",
+  "zip_url": "https://codeload.github.com/MatthewLones/QUANTTxCOM5/zip/e260722ad2adfbc862c963c2e634b70acdb3c5a4",
+  "license_note": "No LICENSE or COPYING file found in this snapshot; public visibility is not an open-source license.",
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 40,
+      "sha256": "f6d434c68ff8d01bf7e96971fd2722637f1bc69f4174d6fa4bb411d787a0588d",
+      "com5_related": true,
+      "role": "COM5 support/reference",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/.gitignore",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/.gitignore"
+    },
+    {
+      "path": "README.md",
+      "bytes": 18535,
+      "sha256": "0232682184ca2390b10d2cbb2843e324638f00c8ff8bc26d4a63ac25ea51bd4b",
+      "com5_related": true,
+      "role": "COM5 support/reference",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/README.md",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/README.md"
+    },
+    {
+      "path": "RIT_-_Case_Brief_-_COM5_-_Commodities_Capstone.pdf",
+      "bytes": 265444,
+      "sha256": "c8e7f9f663fb85cbfd8dc85188a8e0995060dcd855255cdb9f0633120009c97f",
+      "com5_related": true,
+      "role": "COM5 support/reference",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/RIT_-_Case_Brief_-_COM5_-_Commodities_Capstone.pdf",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/RIT_-_Case_Brief_-_COM5_-_Commodities_Capstone.pdf"
+    },
+    {
+      "path": "STRATEGY.md",
+      "bytes": 20886,
+      "sha256": "2fc2f7f8f3412ab98914d42e2f900af5307c3a97cf6c36a8774f23a4bdc67a43",
+      "com5_related": true,
+      "role": "COM5 support/reference",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/STRATEGY.md",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/STRATEGY.md"
+    },
+    {
+      "path": "analyze_data.py",
+      "bytes": 19736,
+      "sha256": "00d66c6c78a87af83aefd24b45d4269bc388d9b6ca0168ffcc67fbfa2f1841c3",
+      "com5_related": true,
+      "role": "Offline analysis",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/analyze_data.py",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/analyze_data.py"
+    },
+    {
+      "path": "bot.py",
+      "bytes": 91561,
+      "sha256": "9280c1f24261d3a73952563e396e16234fd26336724c64f67f2e5993ea545e6a",
+      "com5_related": true,
+      "role": "Trading entrypoint",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/bot.py",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/bot.py"
+    },
+    {
+      "path": "com5_template.py",
+      "bytes": 17445,
+      "sha256": "9c08b3fb0e97821251adc7ae509adeba4a2751acd81f48c059ea6d9c79f2ca6f",
+      "com5_related": true,
+      "role": "Template and shared configuration",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/com5_template.py",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/com5_template.py"
+    },
+    {
+      "path": "data_scraper.py",
+      "bytes": 28811,
+      "sha256": "80ad2daaeff1d0a24d1980b6b446d3ca4ea888c9a226acab959a1c5d8aec0968",
+      "com5_related": true,
+      "role": "Data collection and API stress testing",
+      "github_url": "https://github.com/MatthewLones/QUANTTxCOM5/blob/e260722ad2adfbc862c963c2e634b70acdb3c5a4/data_scraper.py",
+      "raw_url": "https://raw.githubusercontent.com/MatthewLones/QUANTTxCOM5/e260722ad2adfbc862c963c2e634b70acdb3c5a4/data_scraper.py"
+    }
+  ]
+}
