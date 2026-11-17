@@ -227,6 +227,38 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result['positions']['CL-1F'], 5)
         self.assertTrue(result['errors'])
 
+    def test_failed_tank_release_does_not_block_shutdown_position_closeout(self):
+        self.exchange.rows[0]['position'] = 60
+        self.exchange.leases = [dict(id=3040, ticker='CL-STORAGE', containment_usage=0),
+                                dict(id=3031, ticker='CL-STORAGE', containment_usage=60)]
+        original = self.exchange.request
+        deletes = []
+        def request(method, endpoint, params=None):
+            if method == 'DELETE':
+                deletes.append(endpoint)
+                if endpoint == '/leases/3040':
+                    self.exchange.uncertain_write = True
+                    raise TradingHalt('Uncertain server result for DELETE /leases/3040; NOT retried')
+            result = original(method, endpoint, params)
+            if method == 'POST' and endpoint == '/orders':
+                for lease in self.exchange.leases:
+                    if lease['id'] == 3031:
+                        lease['containment_usage'] = self.exchange.rows[0]['position']
+            return result
+        self.exchange.request = request
+        with self.assertRaises(TradingHalt):
+            self.storage.release_empty_storage()
+        transport = bot.TransportEngine(self.state, self.execution, self.storage, self.config)
+        crack = bot.CrackEngine(self.state, self.execution, self.storage, self.config)
+        result = bot.shutdown(self.state, self.execution, self.storage, transport, crack)
+        self.assertEqual(result['positions']['CL'], 0)
+        self.assertEqual(deletes.count('/leases/3040'), 1)
+        self.assertIn('/leases/3031', deletes)
+        self.assertEqual([row['id'] for row in result['leases']], [3040])
+        self.assertFalse(result['flat'])
+        self.assertTrue(result['uncertain_write'])
+        self.assertTrue(result['errors'])
+
     def test_explicit_check_modes_are_read_only(self):
         for flag in ('--check', '--dry-run'):
             with self.subTest(flag=flag), patch.object(bot, 'API_KEY', 'test'), patch.object(bot, 'Client', return_value=self.exchange) as client:

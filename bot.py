@@ -640,6 +640,7 @@ class StorageManager:
     def __init__(self, state, config):
         self.state = state
         self.config = config
+        self.failed_releases = {}
 
     def ensure_storage(self, location, contracts_needed):
         storage_ticker = {"CL": "CL-STORAGE", "AK": "AK-STORAGE",
@@ -686,7 +687,14 @@ class StorageManager:
             return
         for lease in leases:
             if lease.get("ticker") in ("CL-STORAGE", "AK-STORAGE", "NYC-STORAGE") and lease.get("containment_usage") == 0:
-                _delete(f"/leases/{lease['id']}")
+                if lease['id'] in self.failed_releases:
+                    continue  # Do not blindly repeat an uncertain DELETE during shutdown.
+                try:
+                    _delete(f"/leases/{lease['id']}")
+                except (Exception, TradingHalt) as exc:
+                    self.failed_releases[lease['id']] = str(exc)
+        if self.failed_releases:
+            raise TradingHalt(f"Storage release failures (not retried): {self.failed_releases}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1206,7 +1214,7 @@ class PhysicalEngine:
         print(f"  [PHYSICAL] {ticker}: {qty} {source}; expected outputs {outputs}")
         return True
 
-    def complete(self):
+    def complete(self, release_storage=True):
         for job in list(self.jobs):
             if not job["confirmed"] or self.now() < job["due"]:
                 continue
@@ -1227,7 +1235,8 @@ class PhysicalEngine:
                 self.state.refinery_lease_id = None
             else:
                 self.state.active_pipelines.remove(job["id"])
-        self.storage.release_empty_storage()
+        if release_storage:
+            self.storage.release_empty_storage()
 
     def busy(self):
         return bool(self.state.active_pipelines or self.state.refinery_lease_id is not None)
@@ -1806,8 +1815,8 @@ def shutdown(state, execution, storage, transport, crack, seconds=60):
             execution.refresh_positions()
             if case.get("status") != "ACTIVE":
                 break
-            transport.complete()
-            crack.complete()
+            transport.complete(release_storage=False)
+            crack.complete(release_storage=False)
             # Do not consume outputs still belonging to a pending conversion job.
             reserved = {t for engine in (transport, crack) for job in engine.jobs for t in job["outputs"]}
             for ticker, position in list(state.positions.items()):
