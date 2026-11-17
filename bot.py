@@ -1091,7 +1091,7 @@ class BasisEngine:
             if (self.state.available_net_buy("CL") >= contracts and
                     self.state.available_net_sell(active_future(self.state)) >= contracts):
                 if self.storage.ensure_storage("CL", contracts):
-                    print(f"  [BASIS] Convergence: buy CL, short CL-1F "
+                    print(f"  [BASIS] Convergence: buy CL, short {active_future(self.state)} "
                           f"(basis={market_basis:.3f}, theo={theo_basis:.3f})")
                     self._trade_pair("CL", "BUY", active_future(self.state), "SELL", contracts)
 
@@ -1099,7 +1099,7 @@ class BasisEngine:
             held_cl = self.state.get_position("CL")
             sell_qty = min(contracts, held_cl)
             if sell_qty > 0 and self.state.available_net_buy(active_future(self.state)) >= sell_qty:
-                print(f"  [BASIS] Convergence: sell CL, buy CL-1F "
+                print(f"  [BASIS] Convergence: sell CL, buy {active_future(self.state)} "
                       f"(basis={market_basis:.3f}, theo={theo_basis:.3f})")
                 self._trade_pair("CL", "SELL", active_future(self.state), "BUY", sell_qty)
 
@@ -1111,7 +1111,7 @@ class BasisEngine:
             return
         if not self.storage.ensure_storage("CL", contracts):
             return
-        print(f"  [BASIS] Cash-carry: buy 10 CL, short 10 CL-1F "
+        print(f"  [BASIS] Cash-carry: buy 10 CL, short 10 {active_future(self.state)} "
               f"(est profit=${estimated_profit:.0f})")
         self._trade_pair("CL", "BUY", active_future(self.state), "SELL", contracts)
 
@@ -1140,6 +1140,20 @@ class PhysicalEngine:
 
     def now(self):
         return (self.state.period - 1) * self.config.ticks_per_period + self.state.tick
+
+    def confirm_lease(self, lease, ticker):
+        """Wait for the acknowledged lease to appear; never create a replacement."""
+        for attempt in range(30):
+            leases = _get("/leases")
+            match = next((row for row in leases if row.get("id") == lease["id"]), None)
+            if match is not None:
+                if match.get("ticker") != ticker:
+                    raise TradingHalt(f"Lease {lease['id']} ticker mismatch for {ticker}: {match}")
+                return match
+            if attempt < 29:
+                time.sleep(.1)
+        raise TradingHalt(f"Lease {lease['id']} for {ticker} not visible after creation; "
+                          f"no conversion submitted. Creation response: {lease}; active leases: {leases}")
 
     def start_conversion(self, ticker, source, outputs):
         asset = next(a for a in _get("/assets") if a["ticker"] == ticker)
@@ -1185,6 +1199,7 @@ class PhysicalEngine:
             self.state.refinery_lease_id = lease["id"]
         else:
             self.state.active_pipelines.append(lease["id"])
+        self.confirm_lease(lease, ticker)
         _post(f"/leases/{lease['id']}", params)
         job["confirmed"] = True
         self.execution.refresh_positions()

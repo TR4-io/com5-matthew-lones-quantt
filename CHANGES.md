@@ -13,10 +13,12 @@ Baseline: MatthewLones/QUANTTxCOM5 e260722ad2adfbc862c963c2e634b70acdb3c5a4. Sch
 
 Sources for request/schema corrections: [official RIT REST 1.0.4 schema](https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml), supplied COM5 case assumptions and the original source. Full physical mode rejects live conversion metadata that does not match those assumptions.
 
-Validation: 39 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+Validation: 41 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
 
 HTTP rejection messages now include the server response body (bounded to 1,000 characters), so a failed conversion reports RIT's reason instead of only HTTP 400. This is a diagnostic correction; the cause of the reported lease-16 rejection is not yet established. A regression test verifies that the reason is preserved and the request is not retried.
 
 ## Live-feedback follow-up
 
 A live run reported a conversion input mismatch after an apparently completed purchase. The console alone does not establish the cause. Terminal market-order fills are now reconciled against the expected inventory delta with bounded polling before another order or conversion can proceed. Delayed position updates are tolerated without repeating purchases; persistent discrepancies halt with expected/observed quantities and order ID recorded. Other open orders are cancelled before establishing the market-order baseline. A persistent mismatch prevents a clean-shutdown claim. Duplicate STOP output removed. Two regression tests cover delayed and missing inventory updates.
+
+A subsequent live run reported an invalid conversion lease ID. Conversion requests now wait for the acknowledged ID and ticker to appear in GET /leases, with bounded polling and no replacement lease or conversion retries. Missing leases halt with the creation response and active lease list for diagnosis. This handles delayed visibility but does not establish the original rejection cause or guarantee server acceptance. Two regressions cover delayed and missing leases. Basis messages now print the actual active futures ticker (CL-2F in period 2); order selection was already period-aware.

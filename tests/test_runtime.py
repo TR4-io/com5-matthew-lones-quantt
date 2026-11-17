@@ -311,6 +311,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.exchange.leases, [])
         self.assertEqual(self.state.conversion_outputs, set())
 
+    def test_conversion_waits_for_acknowledged_lease(self):
+        engine = bot.CrackEngine(self.state, self.execution, self.storage, self.config)
+        lease = dict(id=1953, ticker='CL-REFINERY')
+        with patch.object(bot, '_get', side_effect=[[], [], [lease]]) as get, patch.object(bot.time, 'sleep'):
+            self.assertEqual(engine.confirm_lease(lease, 'CL-REFINERY'), lease)
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(self.exchange.writes, [])
+
+    def test_missing_conversion_lease_halts_without_recreating(self):
+        engine = bot.CrackEngine(self.state, self.execution, self.storage, self.config)
+        with patch.object(bot, '_get', return_value=[]) as get, patch.object(bot.time, 'sleep'):
+            with self.assertRaisesRegex(TradingHalt, 'no conversion submitted'):
+                engine.confirm_lease(dict(id=1953, ticker='CL-REFINERY'), 'CL-REFINERY')
+        self.assertEqual(get.call_count, 30)
+        self.assertEqual(self.exchange.writes, [])
+
     def test_ctrl_c_live_loop_runs_cleanup_and_saves_summary(self):
         import json
         import os
