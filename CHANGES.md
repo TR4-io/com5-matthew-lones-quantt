@@ -13,4 +13,8 @@ Baseline: MatthewLones/QUANTTxCOM5 e260722ad2adfbc862c963c2e634b70acdb3c5a4. Sch
 
 Sources for request/schema corrections: [official RIT REST 1.0.4 schema](https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml), supplied COM5 case assumptions and the original source. Full physical mode rejects live conversion metadata that does not match those assumptions.
 
-Validation: 35 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+Validation: 37 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+
+## Live-feedback follow-up
+
+A live run reported a conversion input mismatch after an apparently completed purchase. The console alone does not establish the cause. Terminal market-order fills are now reconciled against the expected inventory delta with bounded polling before another order or conversion can proceed. Delayed position updates are tolerated without repeating purchases; persistent discrepancies halt with expected/observed quantities and order ID recorded. Other open orders are cancelled before establishing the market-order baseline. A persistent mismatch prevents a clean-shutdown claim. Duplicate STOP output removed. Two regression tests cover delayed and missing inventory updates.

@@ -36,4 +36,4 @@ The order and shutdown records are in runs/<run_id>/events.jsonl; server NLV obs
 
 ## Validation scope
 
-35 offline tests passed on Python 3.13 with requests 2.32.5. A mocked live loop opened positions, received Ctrl+C, cancelled/closed exposure and wrote its summary. A mocked physical cycle checked the 30/20/10 quantities, output arrival, sale and lease cleanup. No real RIT server trading or profit measurement has been performed. Start with one supervised practice heat and retain the official performance report.
+37 offline tests passed on Python 3.13 with requests 2.32.5. A mocked live loop opened positions, received Ctrl+C, cancelled/closed exposure and wrote its summary. A mocked physical cycle checked the 30/20/10 quantities, output arrival, sale and lease cleanup. No real RIT server trading or profit measurement has been performed. Start with one supervised practice heat and retain the official performance report.

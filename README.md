@@ -40,7 +40,7 @@ The cleanup loop allows about 60 seconds plus any bounded requests already in pr
 python -m unittest discover -s tests -v
 ```
 
-35 offline tests pass, including partial fills, portfolio limits, scheduled exit timing, physical conversion and Ctrl+C lifecycle checks. Tests use mocked REST responses; the code has not been live-tested against your RIT session and profitability is unmeasured.
+37 offline tests pass, including partial fills, portfolio limits, scheduled exit timing, physical conversion and Ctrl+C lifecycle checks. Tests use mocked REST responses; the code has not been live-tested against your RIT session and profitability is unmeasured.
 
 Each live run records `runs/<run_id>/`: `config.json`, `events.jsonl` (including order acknowledgements/results and shutdown reconciliation), `nlv.csv`, `bot.log`, and `summary.json` after an orderly exit. Keep the official RIT report alongside these files. Use final server/official P&L, including lease costs and fines.
 

@@ -367,5 +367,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result['quantity_filled'], 4)
         cancel.assert_called_once_with('/orders/8')
 
+    def test_delayed_inventory_after_fill_waits_without_duplicate_purchase(self):
+        original = self.exchange.request
+        stale = [dict(r) for r in self.exchange.rows]
+        remaining = 0
+        def request(method, endpoint, params=None):
+            nonlocal remaining
+            if method == 'GET' and endpoint == '/securities' and remaining:
+                remaining -= 1
+                return [dict(r) for r in stale]
+            result = original(method, endpoint, params)
+            if method == 'POST' and endpoint == '/orders': remaining = 3
+            return result
+        self.exchange.request = request
+        with patch.object(bot.time, 'sleep'):
+            orders = self.execution.place_split_orders('CL', 'BUY', 30)
+        self.assertEqual(bot.filled(orders), 30)
+        self.assertEqual(self.state.get_position('CL'), 30)
+        self.assertEqual(sum(w[1] == '/orders' for w in self.exchange.writes), 1)
+        self.assertIsNone(self.execution.position_mismatch)
+
+    def test_persistent_inventory_mismatch_halts_without_resubmitting(self):
+        order = dict(order_id=9, ticker='CL', action='BUY', quantity_filled=30)
+        with patch.object(bot.time, 'sleep'), self.assertRaisesRegex(TradingHalt, 'expected 30.0, observed 0.0'):
+            self.execution.confirm_inventory(order, 0)
+        self.assertEqual(self.execution.position_mismatch['order_id'], 9)
+        self.assertEqual(self.exchange.writes, [])
+
 
 if __name__ == '__main__': unittest.main()

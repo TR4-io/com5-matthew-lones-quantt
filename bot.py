@@ -504,6 +504,7 @@ class ExecutionEngine:
     def __init__(self, state, config):
         self.state, self.config = state, config
         self.logger = None
+        self.position_mismatch = None
 
     def refresh_positions(self):
         rows = _get("/securities")
@@ -524,6 +525,9 @@ class ExecutionEngine:
     def place_order(self, ticker, action, quantity, price=None, order_type="MARKET", reduce_only=False):
         if quantity <= 0:
             return None
+        if order_type == "MARKET":
+            # Remove other live orders before establishing the fill baseline.
+            self.cancel_all_orders()
         orders = _get("/orders", {"status": "OPEN"})
         rows = self.refresh_positions()
         row = next((r for r in rows if r["ticker"] == ticker), None)
@@ -555,10 +559,37 @@ class ExecutionEngine:
             self.logger.event("order_ack", self.state.period, self.state.tick, order=result)
         if order_type == "MARKET":
             result = self.finish_order(result)
-            self.refresh_positions()
         if self.logger:
             self.logger.event("order_result", self.state.period, self.state.tick, order=result)
+        if order_type == "MARKET":
+            self.confirm_inventory(result, float(row["position"]))
         return result
+
+    def confirm_inventory(self, order, before):
+        """A terminal fill report can precede the securities inventory update."""
+        ticker = order["ticker"]
+        delta = float(order["quantity_filled"]) * (1 if order["action"] == "BUY" else -1)
+        expected = before + delta
+        observed = None
+        for attempt in range(30):
+            self.refresh_positions()
+            observed = float(self.state.get_position(ticker))
+            if math.isclose(observed, expected, rel_tol=0, abs_tol=1e-8):
+                if self.logger:
+                    self.logger.event("inventory_confirmed", self.state.period, self.state.tick,
+                                      order_id=order["order_id"], ticker=ticker,
+                                      expected=expected, observed=observed, reads=attempt + 1)
+                return
+            if attempt < 29:
+                time.sleep(.1)
+        self.position_mismatch = {"order_id": order["order_id"], "ticker": ticker,
+                                  "before": before, "filled": order["quantity_filled"],
+                                  "expected": expected, "observed": observed}
+        if self.logger:
+            self.logger.event("inventory_mismatch", self.state.period, self.state.tick,
+                              **self.position_mismatch)
+        raise TradingHalt(f"Inventory reconciliation failed for {ticker}, order {order['order_id']}: "
+                          f"expected {expected}, observed {observed}. No order resubmitted.")
 
     def finish_order(self, result):
         oid = result["order_id"]
@@ -1132,7 +1163,7 @@ class PhysicalEngine:
             raise TradingHalt("Incomplete conversion input purchase; stopping before leasing")
         rows = self.execution.refresh_positions()
         if self.state.get_position(source) < qty:
-            raise TradingHalt("Conversion input not confirmed")
+            raise TradingHalt(f"Conversion input not confirmed for {source}: need {qty}, observed {self.state.get_position(source)}")
         # Check the final physical inventory against the same live weighted limits.
         projected = [dict(r) for r in rows]
         next(r for r in projected if r["ticker"] == source)["position"] -= qty
@@ -1778,14 +1809,15 @@ def shutdown(state, execution, storage, transport, crack, seconds=60):
         failures.append("Cleanup interrupted a second time")
     # These reads never imply that a failed cancellation succeeded.
     report = {"positions": dict(state.positions), "open_orders": None, "leases": None,
-              "errors": failures, "flat": False, "uncertain_write": bool(getattr(CLIENT, "uncertain_write", False))}
+              "errors": failures, "flat": False, "uncertain_write": bool(getattr(CLIENT, "uncertain_write", False)),
+              "position_mismatch": execution.position_mismatch}
     try:
         execution.refresh_positions()
         report["positions"] = dict(state.positions)
         report["open_orders"] = _get("/orders", {"status": "OPEN"})
         report["leases"] = _get("/leases")
         state.nlv = _get("/trader").get("nlv", state.nlv)
-        report["flat"] = not report["uncertain_write"] and not any(state.positions.values()) and not report["open_orders"] and not report["leases"]
+        report["flat"] = not report["position_mismatch"] and not report["uncertain_write"] and not any(state.positions.values()) and not report["open_orders"] and not report["leases"]
     except (Exception, TradingHalt, KeyboardInterrupt) as exc:
         report["errors"].append(f"Final reconciliation failed: {exc}")
     print("SHUTDOWN: " + json.dumps(report, default=str))
@@ -1899,9 +1931,10 @@ def run_live(config):
         print("Stop requested. Attempting account cleanup; Ctrl+C again aborts cleanup.")
     except (Exception, TradingHalt) as exc:
         exit_code = 1
-        print(f"STOP: {exc}")
         if log:
             log.error(f"STOP: {exc}")
+        else:
+            print(f"STOP: {exc}")
     finally:
         if owned:
             report = shutdown(state, execution, storage, transport, crack)
