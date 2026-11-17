@@ -12,13 +12,13 @@ Usage:  1. Connect to RIT Client (rit.ethansolnik.com:443)
         3. Paste it below and run this script
 """
 
-import requests
 import os
+import requests
 import time
 
 # ── Config ───────────────────────────────────────────────────────────────────
-API_KEY = os.environ.get("RIT_API_KEY", "")  # Or set your own key here locally.
-BASE = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1")
+API_KEY = os.environ.get("RIT_API_KEY", "")  # Set your own key here or in the environment.
+BASE    = os.environ.get("RIT_BASE_URL", "http://localhost:9999/v1")
 HEADERS = {"X-API-Key": API_KEY} #<-- DO NOT CHANGE THIS
 
 # ── COM5 Case Rules ─────────────────────────────────────────────────────────
@@ -58,11 +58,11 @@ ASSETS = {
 }
 
 # Refinery 3:2:1 crack spread
-# Input:  3 CL contracts  (3,000 barrels)
-# Output: 2 RB contracts (84,000 gallons) + 1 HO contract (42,000 gallons)
-REFINERY_CL_IN   = 3
-REFINERY_RB_OUT  = 84000   # gallons
-REFINERY_HO_OUT  = 42000   # gallons
+# Input:  30 CL contracts (30,000 barrels)
+# Output: 20 RB contracts (840,000 gallons) + 10 HO contracts (420,000 gallons)
+REFINERY_CL_IN   = 30
+REFINERY_RB_OUT  = 840000   # gallons
+REFINERY_HO_OUT  = 420000   # gallons
 REFINERY_COST    = 300000
 
 # Storage penalty if you hold spot CL without a lease
@@ -199,7 +199,7 @@ def cancel_order(order_id):
 
 def cancel_all():
     """Cancel all open orders. Returns: {cancelled: N}"""
-    return _post("/commands/cancel")
+    return _post("/commands/cancel", params={"all": 1})
 
 
 # ── Tenders ──────────────────────────────────────────────────────────────────
@@ -238,9 +238,9 @@ def lease_asset(ticker, quantity=1):
     """Lease an asset (storage, pipeline, or refinery)."""
     return _post("/leases", params={"ticker": ticker, "quantity": quantity})
 
-def use_lease(lease_id, quantity):
+def use_lease(lease_id, quantity, source):
     """Use a leased asset (e.g. transport through pipeline, run refinery)."""
-    return _post(f"/leases/{lease_id}", params={"quantity": quantity})
+    return _post(f"/leases/{lease_id}", params={"from1": source, "quantity1": quantity})
 
 def release_lease(lease_id):
     """Release a leased asset. CRITICAL for refinery — release ASAP after conversion."""
@@ -314,21 +314,21 @@ def run_pipeline(pipe_ticker, quantity=10):
     """
     lease = lease_asset(pipe_ticker)
     lease_id = lease["id"]
-    use_lease(lease_id, quantity)
+    use_lease(lease_id, quantity, {"AK-CS-PIPE": "CL-AK", "CS-NYC-PIPE": "CL"}[pipe_ticker])
     return lease_id
 
 
 # ── Refinery Helper ──────────────────────────────────────────────────────────
-def run_refinery(cl_contracts=3, wait=True):
+def run_refinery(cl_contracts=30, wait=True):
     """
     Lease refinery, convert CL→RB+HO, release.
     Set wait=True to block until conversion completes (45 sec).
-    IMPORTANT: You must hold 3 CL contracts in your position before calling this.
+    IMPORTANT: You must hold 30 CL contracts in your position before calling this.
     Returns lease_id.
     """
     lease = lease_asset("CL-REFINERY")
     lease_id = lease["id"]
-    use_lease(lease_id, cl_contracts)
+    use_lease(lease_id, cl_contracts, "CL")
     if wait:
         time.sleep(ASSETS["CL-REFINERY"]["transfer_sec"] + 1)
         release_lease(lease_id)

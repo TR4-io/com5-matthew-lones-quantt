@@ -1,26 +1,16 @@
-# Runtime corrections — November 17, 2026
+# Original restoration — November 17, 2026
 
-Baseline: MatthewLones/QUANTTxCOM5 e260722ad2adfbc862c963c2e634b70acdb3c5a4. Scheduled exits and the EIA/news/basis/market-making strategy families are retained; the physical lifecycle and main-loop orchestration were rewritten to reconcile real account state.
+Baseline: [MatthewLones/QUANTTxCOM5 e260722a](https://github.com/MatthewLones/QUANTTxCOM5/tree/e260722ad2adfbc862c963c2e634b70acdb3c5a4). All eight original files were first restored and checked against the recorded upstream SHA-256 hashes.
 
-- Live trading is now the default when running bot.py, as requested. Explicit --check or --dry-run selects read-only mode; --live remains compatible. Added --futures-only and local process lock. API credentials come from environment/local configuration rather than the published author's key.
-- Bounded REST timeouts/retries. Uncertain writes halt all engines without blind resubmission.
-- Per-security order caps and shortability, weighted portfolio limits, open-order reservations, fresh inventory before decisions, confirmed partial-fill accounting.
-- Scheduled exits retain timing and unfilled remainders, and cannot reverse a position. Basis legs match fills and unwind mismatches. Market-making quotes no longer accumulate indefinitely.
-- Period-2 EIA/news/basis/MM orders target CL-2F. News entries stop during wind-down. Ctrl+C/error exit attempts cancellation, closeout and explicit reconciliation; unresolved exposure is reported.
-- Fixed lease-use fields and conversion batch/economics, tank capacity fields, input/output confirmation and lease lifecycle. No fabricated zero-cost missing assets. Physical jobs preserve tracking across period changes and retain destination tanks until resolved.
-- Removed duplicate storage-cost subtraction from the cash-and-carry opportunity calculation.
-- Order acknowledgements/results and shutdown records added to events.jsonl. Nonzero exit status on fatal errors or incomplete cleanup.
+Only these executable differences remain:
 
-Sources for request/schema corrections: [official RIT REST 1.0.4 schema](https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml), supplied COM5 case assumptions and the original source. Full physical mode rejects live conversion metadata that does not match those assumptions.
+- Cancel-all supplies `all=1`. The API requires a selector; the original request supplied none.
+- Pipeline/refinery use requests supply `from1` and `quantity1`, which the API requires, instead of the unsupported `quantity` field. Sources are CL-AK for Alaska-to-Cushing and CL for Cushing-to-NYC/refinery. The template helper and its callers use the same fields.
+- The supplied COM5 refinery batch is 30 CL -> 20 RB + 10 HO. The original 3/2/1 is a ratio, not a complete batch. Input checks, request quantity, revenue/cost quantities, gross bookkeeping and template constants now use the full batch. Estimated purchase/sale fees use 60 contracts (30 input plus 30 output).
+- The original author's API key is replaced with a blank user setting supporting RIT_API_KEY. RIT_BASE_URL remains configurable with the original localhost default.
 
-Validation: 42 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+API-field evidence: [RIT REST 1.0.4 schema](https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml), `/commands/cancel` and `/leases/{id}`. Batch evidence: the user's supplied COM5 case and live conversion metadata accepted during earlier runs. These are targeted request/batch corrections, not proof that the full physical strategy works.
 
-HTTP rejection messages now include the server response body (bounded to 1,000 characters), so a failed conversion reports RIT's reason instead of only HTTP 400. This is a diagnostic correction; the cause of the reported lease-16 rejection is not yet established. A regression test verifies that the reason is preserved and the request is not retried.
+Removed all custom runtime/execution/shutdown rewrites, inventory and lease polling patches, command-line modes, and tests of those removed features. Restored original README, strategy documentation, scraper and analysis tool. Original behavior, including its remaining limitations, is preserved outside the explicitly listed fixes. No speculative fixes for the reported invalid lease ID or server DELETE failures remain.
 
-## Live-feedback follow-up
-
-A live run reported a conversion input mismatch after an apparently completed purchase. The console alone does not establish the cause. Terminal market-order fills are now reconciled against the expected inventory delta with bounded polling before another order or conversion can proceed. Delayed position updates are tolerated without repeating purchases; persistent discrepancies halt with expected/observed quantities and order ID recorded. Other open orders are cancelled before establishing the market-order baseline. A persistent mismatch prevents a clean-shutdown claim. Duplicate STOP output removed. Two regression tests cover delayed and missing inventory updates.
-
-A subsequent live run reported an invalid conversion lease ID. Conversion requests now wait for the acknowledged ID and ticker to appear in GET /leases, with bounded polling and no replacement lease or conversion retries. Missing leases halt with the creation response and active lease list for diagnosis. This handles delayed visibility but does not establish the original rejection cause or guarantee server acceptance. Two regressions cover delayed and missing leases. Basis messages now print the actual active futures ticker (CL-2F in period 2); order selection was already period-aware.
-
-A live shutdown exposed a regression introduced by the rewritten cleanup: conversion completion released empty storage before position closeout, allowing a storage DELETE failure to abort closeout. Shutdown now defers storage release until after unreserved positions are closed. Failed storage deletions are recorded and are not blindly repeated; other empty tanks can still be released. Uncertainty and residual leases remain explicit in the shutdown report. A regression reproduces the 60-CL residual scenario and verifies position closeout despite an unresolved tank deletion. This does not establish why the server failed the original DELETE.
+Four focused offline tests verify cancellation arguments, pipeline helper arguments, refinery helper batch, and the bot's refinery input gate/request. Python compilation also passes. No live RIT run was performed. Historical commits retain the earlier implementation for comparison; this restoration does not rewrite Git history.

@@ -3,8 +3,3 @@ runs/
 __pycache__/
 *.pyc
 .claude/
-
-.venv/
-.env
-.env.*
-.bot.lock
