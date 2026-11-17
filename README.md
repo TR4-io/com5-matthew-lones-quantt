@@ -10,7 +10,7 @@ Use Python 3.10+ on the computer running the RIT Client. From this project folde
 python -m pip install -r requirements.txt
 $env:RIT_API_KEY = "YOUR_RIT_CLIENT_KEY"
 python bot.py --check
-python bot.py --live
+python bot.py
 ```
 
 The check is read-only. The live command places simulated orders and leases assets. Use your course's assigned server and COM5 case; API Orders must be enabled by the administrator. A check cannot verify order permission. If needed, set `RIT_BASE_URL` to your client's API address (default `http://localhost:9999/v1`). On macOS/Linux, use `export RIT_API_KEY="YOUR_RIT_CLIENT_KEY"`.
@@ -19,12 +19,12 @@ To test only the futures EIA/news/market-making components:
 
 ```powershell
 python bot.py --check --futures-only
-python bot.py --live --futures-only
+python bot.py --futures-only
 ```
 
 `--futures-only` disables spot/product purchases, cash-and-carry, pipelines and refining. Full mode validates the supplied COM5 physical conversion quantities against live asset metadata; it refuses an incompatible setup instead of guessing units.
 
-Running `python bot.py` without flags performs a one-time read-only check. `--dry-run` is an alias for that check, not a fill simulator. `--help` does not connect to RIT.
+Running `python bot.py` without flags starts live trading when the case is ACTIVE. `--live` remains accepted for compatibility. Use `--check` for a one-time read-only check. `--dry-run` is an alias for that check, not a fill simulator. `--help` does not connect to RIT.
 
 ## Exits and stopping
 
@@ -40,7 +40,7 @@ The cleanup loop allows about 60 seconds plus any bounded requests already in pr
 python -m unittest discover -s tests -v
 ```
 
-37 offline tests pass, including partial fills, portfolio limits, scheduled exit timing, physical conversion and Ctrl+C lifecycle checks. Tests use mocked REST responses; the code has not been live-tested against your RIT session and profitability is unmeasured.
+39 offline tests pass, including partial fills, portfolio limits, scheduled exit timing, physical conversion and Ctrl+C lifecycle checks. Tests use mocked REST responses; the code has not been live-tested against your RIT session and profitability is unmeasured.
 
 Each live run records `runs/<run_id>/`: `config.json`, `events.jsonl` (including order acknowledgements/results and shutdown reconciliation), `nlv.csv`, `bot.log`, and `summary.json` after an orderly exit. Keep the official RIT report alongside these files. Use final server/official P&L, including lease costs and fines.
 

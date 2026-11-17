@@ -227,10 +227,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result['positions']['CL-1F'], 5)
         self.assertTrue(result['errors'])
 
-    def test_default_cli_is_read_only(self):
-        with patch.object(bot, 'API_KEY', 'test'), patch.object(bot, 'Client', return_value=self.exchange):
-            bot.main(['--futures-only'])
-        self.assertEqual(self.exchange.writes, [])
+    def test_explicit_check_modes_are_read_only(self):
+        for flag in ('--check', '--dry-run'):
+            with self.subTest(flag=flag), patch.object(bot, 'API_KEY', 'test'), patch.object(bot, 'Client', return_value=self.exchange) as client:
+                bot.main([flag, '--futures-only'])
+                self.assertFalse(client.call_args.kwargs['live'])
+            self.assertEqual(self.exchange.writes, [])
+
+    def test_default_and_explicit_live_cli_start_live_runner(self):
+        for args in ([], ['--live']):
+            with self.subTest(args=args), patch.object(bot, 'API_KEY', 'test'), patch.object(bot, 'Client') as client, patch.object(bot, 'run_live', return_value=0) as runner, patch.object(bot.os, 'open', return_value=123), patch.object(bot.os, 'fdopen', unittest.mock.mock_open()), patch.object(bot.os, 'unlink'):
+                self.assertEqual(bot.main(args), 0)
+                self.assertTrue(client.call_args.kwargs['live'])
+                runner.assert_called_once()
 
     def test_asset_spec_uses_contract_quantities(self):
         asset = dict(ticker='CL-REFINERY', convert_from=[dict(ticker='CL', quantity=30)],

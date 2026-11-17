@@ -6,7 +6,7 @@ Updated November 17, 2026. Use bot.py as the entrypoint; com5_template.py suppli
 
 Install requirements.txt and set your own RIT_API_KEY environment variable. Alternatively, edit API_KEY locally in com5_template.py, but do not commit your key. RIT_BASE_URL defaults to http://localhost:9999/v1. The original template's external competition server address is historical; use your instructor's server.
 
-Run `python bot.py --check` first. It performs GET requests only, discovers the case, and validates supported physical conversion metadata. It does not prove API order entry is enabled. Then `python bot.py --live` starts trading when the case is ACTIVE. `--futures-only` can be supplied to both commands to test the futures components separately. Starting without --live cannot place orders or acquire leases through bot.py.
+Running `python bot.py` starts live trading when the case is ACTIVE. For an optional read-only check, run `python bot.py --check`. It performs GET requests only, discovers the case, and validates supported physical conversion metadata. It does not prove API order entry is enabled. `--live` is still accepted but is no longer required. `--futures-only` can be supplied to both commands to test the futures components separately. Use `--check` or `--dry-run` explicitly to disable trading.
 
 ## Scheduled exits are still part of the strategy
 
@@ -36,4 +36,4 @@ The order and shutdown records are in runs/<run_id>/events.jsonl; server NLV obs
 
 ## Validation scope
 
-37 offline tests passed on Python 3.13 with requests 2.32.5. A mocked live loop opened positions, received Ctrl+C, cancelled/closed exposure and wrote its summary. A mocked physical cycle checked the 30/20/10 quantities, output arrival, sale and lease cleanup. No real RIT server trading or profit measurement has been performed. Start with one supervised practice heat and retain the official performance report.
+39 offline tests passed on Python 3.13 with requests 2.32.5. A mocked live loop opened positions, received Ctrl+C, cancelled/closed exposure and wrote its summary. A mocked physical cycle checked the 30/20/10 quantities, output arrival, sale and lease cleanup. No real RIT server trading or profit measurement has been performed. Start with one supervised practice heat and retain the official performance report.

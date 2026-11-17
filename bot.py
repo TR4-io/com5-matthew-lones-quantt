@@ -14,7 +14,7 @@ Strategies (priority order):
   5. Crack Spread    — refinery 3:2:1 conversion
   6. Market Making   — liquidity provision between events
 
-Usage: python bot.py --check; python bot.py --live [--futures-only]
+Usage: python bot.py [--futures-only]; python bot.py --check
 """
 
 import argparse
@@ -31,7 +31,7 @@ from collections import defaultdict, deque
 
 from com5_template import API_KEY, BASE, HEADERS
 
-CLIENT = Client(BASE, HEADERS)  # Writes remain disabled until --live.
+CLIENT = Client(BASE, HEADERS)  # main() selects live mode unless explicitly checking.
 
 
 def _get(endpoint, params=None):
@@ -1951,17 +1951,18 @@ def main(argv=None):
     global CLIENT
     parser = argparse.ArgumentParser(description="Matthew Lones COM5 bot with corrected execution and shutdown")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--live", action="store_true", help="Enable orders and asset leases")
-    mode.add_argument("--check", action="store_true", help="Read configuration once; no trading (default)")
+    mode.add_argument("--live", action="store_true", help="Enable orders and asset leases (default)")
+    mode.add_argument("--check", action="store_true", help="Read configuration once; no trading")
     mode.add_argument("--dry-run", action="store_true", help="Alias for read-only --check; does not simulate fills")
     parser.add_argument("--futures-only", action="store_true", help="Run EIA/news/MM futures; disable spot, basis and physical assets")
     args = parser.parse_args(argv)
     if not API_KEY:
         parser.error("Set RIT_API_KEY or API_KEY in com5_template.py to your own RIT Client key")
-    CLIENT = Client(BASE, HEADERS, live=args.live)
+    live = not (args.check or args.dry_run)
+    CLIENT = Client(BASE, HEADERS, live=live)
     config = CaseConfig()
     config.physical_enabled = not args.futures_only
-    if not args.live:
+    if not live:
         config.discover()
         case = _get("/case")
         print(f"READ-ONLY CHECK: status={case.get('status')} period={case.get('period')} tick={case.get('tick')}")

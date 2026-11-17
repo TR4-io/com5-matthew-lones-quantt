@@ -2,7 +2,7 @@
 
 Baseline: MatthewLones/QUANTTxCOM5 e260722ad2adfbc862c963c2e634b70acdb3c5a4. Scheduled exits and the EIA/news/basis/market-making strategy families are retained; the physical lifecycle and main-loop orchestration were rewritten to reconcile real account state.
 
-- Default read-only check; explicit --live required. Added --futures-only and local process lock. API credentials come from environment/local configuration rather than the published author's key.
+- Live trading is now the default when running bot.py, as requested. Explicit --check or --dry-run selects read-only mode; --live remains compatible. Added --futures-only and local process lock. API credentials come from environment/local configuration rather than the published author's key.
 - Bounded REST timeouts/retries. Uncertain writes halt all engines without blind resubmission.
 - Per-security order caps and shortability, weighted portfolio limits, open-order reservations, fresh inventory before decisions, confirmed partial-fill accounting.
 - Scheduled exits retain timing and unfilled remainders, and cannot reverse a position. Basis legs match fills and unwind mismatches. Market-making quotes no longer accumulate indefinitely.
@@ -13,7 +13,7 @@ Baseline: MatthewLones/QUANTTxCOM5 e260722ad2adfbc862c963c2e634b70acdb3c5a4. Sch
 
 Sources for request/schema corrections: [official RIT REST 1.0.4 schema](https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml), supplied COM5 case assumptions and the original source. Full physical mode rejects live conversion metadata that does not match those assumptions.
 
-Validation: 38 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+Validation: 39 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
 
 HTTP rejection messages now include the server response body (bounded to 1,000 characters), so a failed conversion reports RIT's reason instead of only HTTP 400. This is a diagnostic correction; the cause of the reported lease-16 rejection is not yet established. A regression test verifies that the reason is preserved and the request is not retried.
 
