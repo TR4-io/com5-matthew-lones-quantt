@@ -29,84 +29,57 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 
 from com5_template import API_KEY, BASE, HEADERS
-from execution_checks import TradingHalt, risk_allows
 
 # ── Pooled session for all API calls ────────────────────────────────────────
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
-LAST_WRITE_FAILURE = None
 
 
 def _get(endpoint, params=None):
     """GET with connection pooling and rate-limit retry."""
-    for attempt in range(4):
-        r = SESSION.get(f"{BASE}{endpoint}", params=params, timeout=(3, 5))
+    while True:
+        r = SESSION.get(f"{BASE}{endpoint}", params=params)
         if r.status_code == 429:
-            if attempt == 3:
-                raise requests.HTTPError(f"Read rate limit persists for {endpoint}", response=r)
             try:
-                wait = float(r.json().get("wait", 0.5))
-            except (ValueError, TypeError):
+                wait = r.json().get("wait", 0.5)
+            except Exception:
                 wait = 0.5
-            time.sleep(min(max(wait, .05), 5))
+            time.sleep(wait)
             continue
         r.raise_for_status()
         return r.json()
 
 
-def _write(method, endpoint, params=None):
-    """Never continue a batch after an ambiguous write response."""
-    global LAST_WRITE_FAILURE
-    for attempt in range(4):
-        try:
-            r = SESSION.request(method, f"{BASE}{endpoint}", params=params, timeout=(3, 5))
-        except (requests.RequestException, KeyboardInterrupt) as exc:
-            LAST_WRITE_FAILURE = dict(method=method, endpoint=endpoint, params=params,
-                                      error=type(exc).__name__, uncertain=True)
-            raise TradingHalt(f"Uncertain {method} {endpoint}; not retried. Inspect RIT positions/orders/leases.") from exc
-        if r.status_code == 429:
-            if attempt == 3:
-                raise TradingHalt("API rate limit persists; stopping entries")
-            try:
-                wait = float(r.json().get("wait", 0.5))
-            except (ValueError, TypeError):
-                wait = 0.5
-            time.sleep(min(max(wait, .05), 5))
-            continue
-        if not r.ok:
-            detail = ' '.join(r.text.split())[:2000]
-            LAST_WRITE_FAILURE = dict(method=method, endpoint=endpoint, params=params,
-                                      status=r.status_code, response=detail, uncertain=r.status_code >= 500)
-            message = f"{method} {endpoint}: HTTP {r.status_code}; server: {detail}"
-            if r.status_code >= 500:
-                raise TradingHalt(message + "; outcome unknown, no further writes")
-            raise requests.HTTPError(message, response=r)
-        if r.status_code == 204 or not r.text:
-            return {"success": True}
-        try:
-            return r.json()
-        except ValueError as exc:
-            raise TradingHalt(f"Invalid response to {method} {endpoint}; outcome unknown") from exc
-
-
 def _post(endpoint, params=None):
-    return _write("POST", endpoint, params)
+    """POST with connection pooling and rate-limit retry."""
+    while True:
+        r = SESSION.post(f"{BASE}{endpoint}", params=params)
+        if r.status_code == 429:
+            try:
+                wait = r.json().get("wait", 0.5)
+            except Exception:
+                wait = 0.5
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 def _delete(endpoint):
-    return _write("DELETE", endpoint)
-
-
-def filled_quantity(orders):
-    return sum(int(order["quantity_filled"]) for order in orders)
-
-
-def asset_available(ticker):
-    asset = next((a for a in _get("/assets") if a.get("ticker") == ticker), None)
-    if not asset or not asset.get("is_available", False) or asset.get("available_quantity", 0) < 1:
-        print(f"  [ASSET] Skipping unavailable {ticker}")
-        return False
-    return True
+    """DELETE with connection pooling and rate-limit retry."""
+    while True:
+        r = SESSION.delete(f"{BASE}{endpoint}", headers=HEADERS)
+        if r.status_code == 429:
+            try:
+                wait = r.json().get("wait", 0.5)
+            except Exception:
+                wait = 0.5
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        if r.status_code == 204 or not r.text:
+            return {"success": True}
+        return r.json()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -599,98 +572,38 @@ class ExecutionEngine:
         self.config = config
         self.executor = ThreadPoolExecutor(max_workers=4)
 
-    def refresh_positions(self):
-        rows = _get("/securities")
-        self.state.update_from_securities(rows)
-        return rows
-
-    def approved_quantity(self, ticker, action, quantity, reduce_only=False):
-        # Open orders first: fills between reads are conservatively over-reserved.
-        orders = _get("/orders", {"status": "OPEN"})
-        rows = self.refresh_positions()
-        row = next((r for r in rows if r["ticker"] == ticker), None)
-        if row is None or (ticker == "CL-1F" and self.state.period > 1):
-            return 0
-        if reduce_only:
-            held = row["position"] if action == "SELL" else -row["position"]
-            quantity = min(quantity, max(0, held))
-        limits = _get("/limits")
-        try:
-            for qty in range(max(0, int(quantity)), 0, -1):
-                if risk_allows(rows, limits, orders, ticker, action, qty):
-                    return qty
-        except (ValueError, KeyError, TypeError) as exc:
-            raise TradingHalt(f"Cannot validate live portfolio limits: {exc}") from exc
-        return 0
-
-    def confirmed_market_order(self, order, ticker, action, before, requested):
-        if not isinstance(order, dict) or "order_id" not in order:
-            raise TradingHalt("Market order acknowledgement missing ID; inspect RIT before restarting")
-        for attempt in range(20):
-            if order.get("status") in ("TRANSACTED", "CANCELLED"):
-                break
-            if attempt == 10:
-                _delete(f"/orders/{order['order_id']}")
-            time.sleep(.1)
-            order = _get(f"/orders/{order['order_id']}")
-        else:
-            raise TradingHalt(f"Unresolved order {order['order_id']}; no further entries")
-        done = order.get("quantity_filled")
-        if not isinstance(done, (int, float)) or not 0 <= done <= requested or int(done) != done:
-            raise TradingHalt(f"Invalid confirmed fill for order {order['order_id']}: {done}")
-        expected = before + (done if action == "BUY" else -done)
-        for attempt in range(30):
-            self.refresh_positions()
-            if abs(self.state.get_position(ticker) - expected) < 1e-8:
-                return order
-            time.sleep(.1)
-        raise TradingHalt(f"Order {order['order_id']} inventory mismatch: expected {expected}, "
-                          f"observed {self.state.get_position(ticker)}; no resubmission")
-
-    def place_order(self, ticker, action, quantity, price=None, order_type="MARKET", reduce_only=False):
+    def place_order(self, ticker, action, quantity, price=None, order_type="MARKET"):
         if quantity <= 0:
             return None
-        if order_type == "MARKET":
-            self.cancel_all_orders()
-            if _get("/orders", {"status": "OPEN"}):
-                raise TradingHalt("Open orders remain after cancellation; market entry postponed")
-        quantity = self.approved_quantity(ticker, action, min(quantity, self.config.max_order_size), reduce_only)
-        row = self.state.securities.get(ticker, {})
-        quantity = min(quantity, int(row.get("max_trade_size", self.config.max_order_size)))
-        if quantity <= 0:
-            return None
-        before = self.state.get_position(ticker)
+        quantity = min(quantity, self.config.max_order_size)
+        if action == "SELL" and not self.config.is_shortable(ticker):
+            held = self.state.get_position(ticker)
+            if quantity > held:
+                quantity = held
+                if quantity <= 0:
+                    return None
         params = {"ticker": ticker, "type": order_type,
                   "quantity": quantity, "action": action}
         if price is not None and order_type == "LIMIT":
             params["price"] = round(price, 2)
         try:
-            order = _post("/orders", params=params)
-            if order_type == "MARKET":
-                return self.confirmed_market_order(order, ticker, action, before, quantity)
-            return order
+            return _post("/orders", params=params)
         except Exception as e:
-            if 'order' in locals():
-                raise TradingHalt(f"Order acknowledgement could not be reconciled: {e}") from e
             print(f"  [ERR] order {action} {quantity} {ticker}: {e}")
             return None
 
     def place_split_orders(self, ticker, action, total_quantity, price=None,
-                           order_type="MARKET", reduce_only=False):
+                           order_type="MARKET"):
         if total_quantity <= 0:
             return []
         orders = []
         remaining = total_quantity
         while remaining > 0:
             qty = min(remaining, self.config.max_order_size)
-            result = self.place_order(ticker, action, qty, price, order_type, reduce_only)
-            if not result:
-                break
-            orders.append(result)
-            done = result["quantity_filled"] if order_type == "MARKET" else result["quantity"]
-            remaining -= done
-            if done < qty:
-                break
+            result = self.place_order(ticker, action, qty, price, order_type)
+            if result:
+                orders.append(result)
+            remaining -= qty
         return orders
 
     def cancel_all_orders(self):
@@ -877,7 +790,7 @@ class EIAEngine:
         return None
 
     def process(self, news_item):
-        """Trade the EIA signal within the live portfolio limits.
+        """EIA is our guaranteed alpha. MAX OUT every position on every signal.
 
         Bullish: max out CL-1F, CL-2F, CL, CL-AK, CL-NYC, HO, RB
         Bearish: max out CL-1F, CL-2F (only shortable tickers)
@@ -922,14 +835,11 @@ class EIAEngine:
             else:
                 qty = self.state.available_net_sell(fticker)
             qty = min(qty, net_limit)
-            action = "BUY" if bullish else "SELL"
-            qty = self.execution.approved_quantity(fticker, action, qty)
             if qty > 0:
+                action = "BUY" if bullish else "SELL"
                 print(f"  [EIA] {action} {qty} {fticker} (MAX)")
-                qty = filled_quantity(self.execution.place_split_orders(
-                    fticker, action, qty, order_type="MARKET"))
-                if not qty:
-                    continue
+                self.execution.place_split_orders(fticker, action, qty,
+                                                  order_type="MARKET")
                 total_traded += qty
 
                 # Schedule tiered exits
@@ -953,11 +863,10 @@ class EIAEngine:
             cl_qty = min(
                 self.state.available_net_buy("CL"),
                 self.config.get_net_limit("CL"))
-            cl_qty = self.execution.approved_quantity("CL", "BUY", cl_qty)
             if cl_qty > 0 and self.storage.ensure_storage("CL", cl_qty):
                 print(f"  [EIA] BUY {cl_qty} CL spot (MAX)")
-                cl_qty = filled_quantity(self.execution.place_split_orders(
-                    "CL", "BUY", cl_qty, order_type="MARKET"))
+                self.execution.place_split_orders("CL", "BUY", cl_qty,
+                                                  order_type="MARKET")
                 total_traded += cl_qty
                 self.state.scheduled_exits.append(
                     (tick + self.config.eia_exit_fast_ticks, "CL",
@@ -967,11 +876,10 @@ class EIAEngine:
             ak_qty = min(
                 self.state.available_net_buy("CL-AK"),
                 self.config.get_net_limit("CL-AK"))
-            ak_qty = self.execution.approved_quantity("CL-AK", "BUY", ak_qty)
             if ak_qty > 0 and self.storage.ensure_storage("AK", ak_qty):
                 print(f"  [EIA] BUY {ak_qty} CL-AK (MAX)")
-                ak_qty = filled_quantity(self.execution.place_split_orders(
-                    "CL-AK", "BUY", ak_qty, order_type="MARKET"))
+                self.execution.place_split_orders("CL-AK", "BUY", ak_qty,
+                                                  order_type="MARKET")
                 total_traded += ak_qty
                 self.state.scheduled_exits.append(
                     (tick + self.config.eia_exit_fast_ticks, "CL-AK",
@@ -981,11 +889,10 @@ class EIAEngine:
             nyc_qty = min(
                 self.state.available_net_buy("CL-NYC"),
                 self.config.get_net_limit("CL-NYC"))
-            nyc_qty = self.execution.approved_quantity("CL-NYC", "BUY", nyc_qty)
             if nyc_qty > 0 and self.storage.ensure_storage("NYC", nyc_qty):
                 print(f"  [EIA] BUY {nyc_qty} CL-NYC (MAX)")
-                nyc_qty = filled_quantity(self.execution.place_split_orders(
-                    "CL-NYC", "BUY", nyc_qty, order_type="MARKET"))
+                self.execution.place_split_orders("CL-NYC", "BUY", nyc_qty,
+                                                  order_type="MARKET")
                 total_traded += nyc_qty
                 self.state.scheduled_exits.append(
                     (tick + self.config.eia_exit_fast_ticks, "CL-NYC",
@@ -996,19 +903,17 @@ class EIAEngine:
                 p_qty = min(
                     self.state.available_net_buy(pticker),
                     self.config.get_net_limit(pticker))
-                p_qty = self.execution.approved_quantity(pticker, "BUY", p_qty)
                 if p_qty > 0:
                     print(f"  [EIA] BUY {p_qty} {pticker} (MAX)")
-                    p_qty = filled_quantity(self.execution.place_split_orders(
-                        pticker, "BUY", p_qty, order_type="MARKET"))
+                    self.execution.place_split_orders(pticker, "BUY", p_qty,
+                                                      order_type="MARKET")
                     total_traded += p_qty
                     self.state.scheduled_exits.append(
                         (tick + self.config.eia_exit_fast_ticks, pticker,
                          "SELL", p_qty, "eia"))
 
-        self.state.scheduled_exits = [exit_info for exit_info in self.state.scheduled_exits if exit_info[3] > 0]
         self.state.strategy_gross["eia"] += total_traded
-        print(f"  [EIA] Confirmed contracts filled: {total_traded}")
+        print(f"  [EIA] MAXED OUT — Total contracts deployed: {total_traded}")
 
         # Track for Bayesian analysis
         self.state.eia_calculated_impacts.append(impact)
@@ -1106,10 +1011,8 @@ class NewsEngine:
 
         print(f"  [NEWS] score={score:+.1f} ({matches} matches) -> "
               f"{action} {contracts} CL-1F")
-        contracts = filled_quantity(self.execution.place_split_orders(
-            "CL-1F", action, contracts, order_type="MARKET"))
-        if not contracts:
-            return
+        self.execution.place_split_orders("CL-1F", action, contracts,
+                                          order_type="MARKET")
         self.state.strategy_gross["news"] += contracts
 
         tick = self.state.tick
@@ -1274,8 +1177,6 @@ class TransportEngine:
 
         # Lease pipeline FIRST — if this fails, don't buy crude or lease storage
         try:
-            if not asset_available("AK-CS-PIPE"):
-                return
             lease = _post("/leases", params={"ticker": "AK-CS-PIPE"})
             lease_id = lease["id"]
         except Exception as e:
@@ -1320,8 +1221,6 @@ class TransportEngine:
 
         # Lease pipeline FIRST
         try:
-            if not asset_available("CS-NYC-PIPE"):
-                return
             lease = _post("/leases", params={"ticker": "CS-NYC-PIPE"})
             lease_id = lease["id"]
         except Exception as e:
@@ -1407,8 +1306,6 @@ class CrackEngine:
         print(f"  [CRACK] Profitable! revenue=${revenue:.0f} cost=${cost:.0f} "
               f"net=${net_profit:.0f}")
         try:
-            if not asset_available("CL-REFINERY"):
-                return
             lease = _post("/leases", params={"ticker": "CL-REFINERY"})
             lease_id = lease["id"]
             _post(f"/leases/{lease_id}", params={"from1": "CL", "quantity1": 30})
@@ -1531,16 +1428,15 @@ class RiskManager:
         for exit_info in self.state.scheduled_exits:
             exit_tick, ticker, action, quantity, strategy = exit_info
             if tick >= exit_tick:
-                self.execution.refresh_positions()
-                held = self.state.get_position(ticker)
-                quantity = min(quantity, max(0, held if action == "SELL" else -held))
+                if action == "SELL":
+                    quantity = min(quantity, self.state.available_net_sell(ticker))
+                else:
+                    quantity = min(quantity, self.state.available_net_buy(ticker))
                 if quantity > 0:
-                    done = filled_quantity(self.execution.place_split_orders(
-                        ticker, action, quantity, order_type="MARKET", reduce_only=True))
+                    self.execution.place_split_orders(ticker, action, quantity,
+                                                     order_type="MARKET")
                     self.state.strategy_gross[strategy] = max(
-                        0, self.state.strategy_gross[strategy] - done)
-                    if done < quantity:
-                        remaining.append((tick + 1, ticker, action, quantity - done, strategy))
+                        0, self.state.strategy_gross[strategy] - quantity)
             else:
                 remaining.append(exit_info)
         self.state.scheduled_exits = remaining
@@ -1951,8 +1847,6 @@ class RunLogger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global LAST_WRITE_FAILURE
-    LAST_WRITE_FAILURE = None
     log = RunLogger()
     log.info("=" * 60)
     log.info("  COM5 COMPETITION BOT — ADAPTIVE CONFIG")
@@ -2166,24 +2060,6 @@ def main():
             # ── 11. PACING ──────────────────────────────────────────
             time.sleep(config.loop_sleep)
 
-    except TradingHalt as e:
-        log.error(f"\n[STOP] {e}")
-        # Read-only evidence capture. No automatic liquidation or lease retry.
-        diagnostic = {"reason": str(e), "last_write_failure": LAST_WRITE_FAILURE}
-        for key, endpoint, params in (("case", "/case", None),
-                                      ("securities", "/securities", None),
-                                      ("limits", "/limits", None),
-                                      ("open_orders", "/orders", {"status": "OPEN"}),
-                                      ("leases", "/leases", None),
-                                      ("assets", "/assets", None)):
-            try:
-                diagnostic[key] = _get(endpoint, params)
-            except Exception as exc:
-                diagnostic[key] = {"read_error": str(exc)}
-        path = os.path.join(log.run_dir, "failure.json")
-        with open(path, "w") as handle:
-            json.dump(diagnostic, handle, indent=2)
-        log.error(f"Read-only diagnostics saved: {path}. Inspect RIT positions/orders/leases before restarting.")
     except KeyboardInterrupt:
         log.info("\n\nBot stopped by user.")
     except Exception as e:

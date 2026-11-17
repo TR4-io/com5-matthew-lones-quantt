@@ -42,7 +42,7 @@ class MinimalFixTests(unittest.TestCase):
         config.fee_per_contract = 1
         config.crack_min_profit = 1000
         engine = bot.CrackEngine(state, Mock(), Mock(), config)
-        with patch.object(bot, '_post', return_value={'id': 9}) as post, patch.object(bot, 'asset_available', return_value=True):
+        with patch.object(bot, '_post', return_value={'id': 9}) as post:
             state.get_position.return_value = 29
             engine.evaluate()
             post.assert_not_called()
