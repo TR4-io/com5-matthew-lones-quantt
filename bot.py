@@ -460,9 +460,7 @@ class StateManager:
         self.start_price = None
         self.fair_value = None
         self.scheduled_exits.clear()
-        self.refinery_lease_id = None
-        self.refinery_start_tick = None
-        self.active_pipelines.clear()
+        # Physical leases and in-flight deliveries survive period boundaries.
         self.price_history.clear()
         print(f"\n{'='*60}")
         print(f"  PERIOD {new_period} STARTED")
@@ -670,26 +668,24 @@ class StorageManager:
         return count * self.config.get_asset_capacity(storage_ticker)
 
     def release_empty_storage(self):
-        contract_size = self.config.get_contract_size("CL")
-        needed = {
-            "CL-STORAGE": max(0, self.state.get_position("CL")) * contract_size,
-            "AK-STORAGE": max(0, self.state.get_position("CL-AK")) * contract_size,
-            "NYC-STORAGE": max(0, self.state.get_position("CL-NYC")) * contract_size,
-        }
-        for lease_id, lease in list(self.state.leases.items()):
-            ticker = lease.get("ticker", "")
-            if ticker not in needed:
+        # Use the server's occupancy, not stale local position estimates.
+        leases = _get("/leases")
+        self.state.leases = {lease["id"]: lease for lease in leases}
+        if self.state.active_pipelines or self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
+            return  # Destination storage is still reserved for incoming goods.
+        if any(lease.get("ticker") in ("AK-CS-PIPE", "CS-NYC-PIPE", "CL-REFINERY") for lease in leases):
+            return
+        for lease in leases:
+            if lease.get("ticker") not in ("CL-STORAGE", "AK-STORAGE", "NYC-STORAGE"):
                 continue
-            capacity = self.config.get_asset_capacity(ticker)
-            if needed[ticker] <= 0:
-                try:
-                    _delete(f"/leases/{lease_id}")
-                    del self.state.leases[lease_id]
-                    print(f"  [STORAGE] Released {ticker} (lease {lease_id})")
-                except Exception as e:
-                    print(f"  [ERR] release {ticker}: {e}")
-            else:
-                needed[ticker] -= capacity
+            if lease.get("containment_usage") != 0:
+                continue
+            try:
+                _delete(f"/leases/{lease['id']}")
+                self.state.leases.pop(lease["id"], None)
+                print(f"  [STORAGE] Released {lease['ticker']} (lease {lease['id']})")
+            except Exception as exc:
+                print(f"  [ERR] Storage lease {lease['id']} still needs release: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1131,6 +1127,64 @@ class BasisEngine:
 #  GEOGRAPHIC ARB ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def physical_time(state, config):
+    return (state.period - 1) * config.ticks_per_period + state.tick
+
+
+def refresh_physical(state):
+    state.update_from_securities(_get("/securities"))
+    state.leases = {lease["id"]: lease for lease in _get("/leases")}
+
+
+def physical_post(endpoint, params):
+    try:
+        return _post(endpoint, params=params)
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is not None:
+            print(f"  [ASSET ERROR] {endpoint}: HTTP {response.status_code}; {response.text[:1500]}")
+        raise
+
+
+def release_physical_lease(state, lease_id):
+    """Forget a lease only when a fresh server read confirms it is gone."""
+    try:
+        state.leases = {lease["id"]: lease for lease in _get("/leases")}
+        if lease_id in state.leases:
+            _delete(f"/leases/{lease_id}")
+            state.leases = {lease["id"]: lease for lease in _get("/leases")}
+        return lease_id not in state.leases
+    except Exception as exc:
+        print(f"  [ERR] Lease {lease_id} release unresolved; retaining tracking: {exc}")
+        return False
+
+
+def sell_physical_output(job, ticker, quantity, state, execution):
+    """Track this physical sale until its fill and inventory change agree."""
+    pending = job.setdefault("sales", {})
+    if ticker not in pending:
+        before = state.get_position(ticker)
+        orders = execution.place_split_orders(ticker, "SELL", quantity, order_type="MARKET")
+        pending[ticker] = {"before": before, "orders": orders}
+        if not orders or any("order_id" not in order for order in orders):
+            pending[ticker]["unresolved"] = True
+            print(f"  [ASSET] {ticker} sale unresolved; no automatic resubmission. Inspect RIT.")
+    sale = pending[ticker]
+    if sale.get("unresolved"):
+        return 0
+    for index, order in enumerate(sale["orders"]):
+        if order.get("status") not in ("TRANSACTED", "CANCELLED"):
+            sale["orders"][index] = _get(f"/orders/{order['order_id']}")
+    if any(order.get("status") not in ("TRANSACTED", "CANCELLED") for order in sale["orders"]):
+        return 0
+    filled = sum(order.get("quantity_filled", 0) for order in sale["orders"])
+    state.update_from_securities(_get("/securities"))
+    if state.get_position(ticker) != sale["before"] - filled:
+        return 0  # Keep the pending sale; don't sell twice on a stale snapshot.
+    del pending[ticker]
+    return min(quantity, filled)
+
+
 class TransportEngine:
     def __init__(self, state, execution, storage, config):
         self.state = state
@@ -1140,7 +1194,8 @@ class TransportEngine:
         # Cooldown: don't retry pipelines for N ticks after a failure
         self._ak_cs_cooldown_until = 0
         self._cs_nyc_cooldown_until = 0
-        self.COOLDOWN_TICKS = 60  # wait 60 ticks after a 500 error
+        self.COOLDOWN_TICKS = 60  # retained original opportunity cooldown
+        self._unresolved_pipelines = set()
 
     def evaluate(self):
         tick = self.state.tick
@@ -1175,28 +1230,7 @@ class TransportEngine:
         print(f"  [TRANSPORT] AK->CS spread=${spread:.2f} (need ${required:.2f}), "
               f"est profit=${profit:.0f}")
 
-        # Lease pipeline FIRST — if this fails, don't buy crude or lease storage
-        try:
-            lease = _post("/leases", params={"ticker": "AK-CS-PIPE"})
-            lease_id = lease["id"]
-        except Exception as e:
-            print(f"  [ERR] AK-CS pipeline lease failed: {e}")
-            self._ak_cs_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
-            return
-
-        if not self.storage.ensure_storage("AK", contracts):
-            return
-        self.execution.place_split_orders("CL-AK", "BUY", contracts,
-                                          order_type="MARKET")
-        try:
-            _post(f"/leases/{lease_id}", params={"from1": "CL-AK", "quantity1": contracts})
-            self.state.active_pipelines.append(
-                (lease_id, self.state.tick, "AK-CS-PIPE", contracts))
-            self.state.strategy_gross["transport"] += contracts
-            print(f"  [TRANSPORT] AK->CS pipeline started")
-        except Exception as e:
-            print(f"  [ERR] AK-CS pipeline use: {e}")
-            self._ak_cs_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
+        self._start_pipeline("AK-CS-PIPE", "CL-AK", "AK", "CL", "CL", contracts, buy_input=True)
 
     def _check_cushing_to_nyc(self):
         _, _, cl_last = self.state.get_price("CL")
@@ -1211,54 +1245,85 @@ class TransportEngine:
             return
 
         held_cl = self.state.get_position("CL")
-        contracts = min(10, held_cl)
-        if contracts <= 0 or self.state.available_gross("transport") < contracts:
+        contracts = 10
+        if held_cl < contracts or self.state.available_gross("transport") < contracts:
             return
 
         profit = (spread - breakeven) * 10000
         print(f"  [TRANSPORT] CS->NYC spread=${spread:.2f} (need ${required:.2f}), "
               f"est profit=${profit:.0f}")
 
-        # Lease pipeline FIRST
-        try:
-            lease = _post("/leases", params={"ticker": "CS-NYC-PIPE"})
-            lease_id = lease["id"]
-        except Exception as e:
-            print(f"  [ERR] CS-NYC pipeline lease failed: {e}")
-            self._cs_nyc_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
-            return
+        self._start_pipeline("CS-NYC-PIPE", "CL", "CL", "CL-NYC", "NYC", contracts)
 
-        if not self.storage.ensure_storage("NYC", contracts):
+    def _start_pipeline(self, pipe, source, source_location, destination, destination_location, contracts, buy_input=False):
+        if self.state.active_pipelines or self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
+            return  # Keep one physical batch attributable while it is in flight.
+        if pipe in self._unresolved_pipelines:
+            return
+        refresh_physical(self.state)
+        # Rent capacity at BOTH ends before submitting the conversion.
+        held = self.state.get_position(source)
+        if not self.storage.ensure_storage(source_location, max(contracts, held)):
+            return
+        if not self.storage.ensure_storage(destination_location, self.state.get_position(destination) + contracts):
+            return
+        if held < contracts and buy_input:
+            self.execution.place_split_orders(source, "BUY", contracts - held, order_type="MARKET")
+        for attempt in range(30):
+            self.state.update_from_securities(_get("/securities"))
+            if self.state.get_position(source) >= contracts:
+                break
+            time.sleep(.1)
+        else:
+            print(f"  [TRANSPORT] {pipe}: input not available; no pipeline leased")
+            self.storage.release_empty_storage()
             return
         try:
-            _post(f"/leases/{lease_id}", params={"from1": "CL", "quantity1": contracts})
-            self.state.active_pipelines.append(
-                (lease_id, self.state.tick, "CS-NYC-PIPE", contracts))
-            self.state.strategy_gross["transport"] += contracts
-            print(f"  [TRANSPORT] CS->NYC pipeline started")
-        except Exception as e:
-            print(f"  [ERR] CS-NYC pipeline use: {e}")
-            self._cs_nyc_cooldown_until = self.state.tick + self.COOLDOWN_TICKS
+            # Pipelines are started directly with their input; no second use request.
+            lease = physical_post("/leases", {"ticker": pipe, "from1": source, "quantity1": contracts})
+            lease_id = lease["id"]
+        except Exception as exc:
+            # The request may have reached the server. Do not repeatedly create it.
+            self._unresolved_pipelines.add(pipe)
+            self.state.physical_uncertain = True
+            print(f"  [ERR] {pipe} start unresolved: {exc}. No automatic resubmission; inspect RIT leases.")
+            return
+        self.state.active_pipelines.append({"id": lease_id, "pipe": pipe, "destination": destination,
+            "due": physical_time(self.state, self.config) + self.config.get_transfer_sec(pipe) + 1,
+            "remaining": contracts, "quantity": contracts})
+        self.state.strategy_gross["transport"] += contracts
+        print(f"  [TRANSPORT] {pipe} started with {contracts} {source}; lease {lease_id}")
 
     def check_pipeline_completions(self):
-        tick = self.state.tick
-        completed = []
-        for i, (lease_id, start_tick, pipe, qty) in enumerate(
-                self.state.active_pipelines):
-            xfer_time = self.config.get_transfer_sec(pipe)
-            if tick - start_tick >= xfer_time + 1:
-                completed.append(i)
-                if pipe == "AK-CS-PIPE":
-                    self.execution.place_split_orders("CL", "SELL", qty,
-                                                     order_type="MARKET")
-                    print(f"  [TRANSPORT] AK->CS complete, selling {qty} CL")
-                elif pipe == "CS-NYC-PIPE":
-                    self.execution.place_split_orders("CL-NYC", "SELL", qty,
-                                                     order_type="MARKET")
-                    print(f"  [TRANSPORT] CS->NYC complete, selling {qty} CL-NYC")
-                self.state.strategy_gross["transport"] -= qty
-        for i in reversed(completed):
-            self.state.active_pipelines.pop(i)
+        for job in list(self.state.active_pipelines):
+            if physical_time(self.state, self.config) < job["due"]:
+                continue
+            refresh_physical(self.state)
+            lease = self.state.leases.get(job["id"])
+            if lease and lease.get("convert_finish_tick") is not None:
+                finish = ((lease.get("convert_finish_period") or self.state.period) - 1) * self.config.ticks_per_period + lease["convert_finish_tick"]
+                if physical_time(self.state, self.config) < finish:
+                    continue
+            ticker = job["destination"]
+            if not job.get("delivered"):
+                if self.state.get_position(ticker) < job["remaining"]:
+                    continue
+                job["delivered"] = True
+            if not job.get("released"):
+                job["released"] = release_physical_lease(self.state, job["id"])
+            if job["remaining"]:
+                before = self.state.get_position(ticker)
+                if before < job["remaining"] and ticker not in job.get("sales", {}):
+                    continue  # Do not declare completion on elapsed time alone.
+                job["remaining"] -= sell_physical_output(job, ticker, job["remaining"], self.state, self.execution)
+                if job["remaining"]:
+                    continue
+            if not job.get("released"):
+                continue
+            self.state.active_pipelines.remove(job)
+            self.state.strategy_gross["transport"] -= job["quantity"]
+            print(f"  [TRANSPORT] {job['pipe']} delivered, sold, and lease closed")
+        self.storage.release_empty_storage()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1271,14 +1336,17 @@ class CrackEngine:
         self.execution = execution
         self.storage = storage
         self.config = config
+        self.job = None
+        self.creation_uncertain = False
 
     def evaluate(self):
         tick = self.state.tick
         refinery_time = self.config.get_transfer_sec("CL-REFINERY")
         if tick >= self.config.ticks_per_period - refinery_time - 15:
             return
-        if self.state.refinery_lease_id is not None:
+        if self.state.refinery_lease_id is not None or self.state.active_pipelines or self.creation_uncertain or getattr(self.state, "physical_uncertain", False):
             return
+        refresh_physical(self.state)
 
         _, _, cl_last = self.state.get_price("CL")
         _, _, rb_last = self.state.get_price("RB")
@@ -1305,40 +1373,88 @@ class CrackEngine:
 
         print(f"  [CRACK] Profitable! revenue=${revenue:.0f} cost=${cost:.0f} "
               f"net=${net_profit:.0f}")
+        before_ids = set(self.state.leases)
         try:
-            lease = _post("/leases", params={"ticker": "CL-REFINERY"})
-            lease_id = lease["id"]
-            _post(f"/leases/{lease_id}", params={"from1": "CL", "quantity1": 30})
-            self.state.refinery_lease_id = lease_id
-            self.state.refinery_start_tick = tick
+            lease = physical_post("/leases", {"ticker": "CL-REFINERY"})
+            self.state.refinery_lease_id = lease["id"]  # Track BEFORE attempting use.
+            # Use the actual active lease, not an unverified creation response.
+            for attempt in range(30):
+                leases = _get("/leases")
+                candidates = [row for row in leases if row.get("ticker") == "CL-REFINERY" and row["id"] not in before_ids]
+                if len(candidates) == 1:
+                    self.state.refinery_lease_id = candidates[0]["id"]
+                    break
+                time.sleep(.1)
+            else:
+                self.creation_uncertain = True
+                self.state.physical_uncertain = True
+                print(f"  [ERR] Refinery creation not reconciled: {lease}; active leases: {leases}. Inspect RIT.")
+                return
+        except Exception as exc:
+            self.creation_uncertain = True
+            self.state.physical_uncertain = True
+            print(f"  [ERR] Refinery creation unresolved: {exc}; no automatic replacement lease")
+            return
+        lease_id = self.state.refinery_lease_id
+        self.job = {"id": lease_id, "started": False, "rejected": False, "released": False,
+                    "due": physical_time(self.state, self.config) + refinery_time + 1,
+                    "remaining": {"RB": 20, "HO": 10}}
+        try:
+            physical_post(f"/leases/{lease_id}", {"from1": "CL", "quantity1": 30})
+            self.job["started"] = True
+            self.state.refinery_start_tick = physical_time(self.state, self.config)
             self.state.strategy_gross["crack"] += 30
-            print(f"  [CRACK] Refinery started ({refinery_time} sec)")
-        except Exception as e:
-            print(f"  [ERR] refinery: {e}")
+            print(f"  [CRACK] Refinery {lease_id} started with 30 CL ({refinery_time} sec)")
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            self.job["rejected"] = response is not None and 400 <= response.status_code < 500
+            print(f"  [ERR] Refinery {lease_id} use failed; lease remains tracked: {exc}")
+            self.check_refinery_completion()
 
     def check_refinery_completion(self):
-        if self.state.refinery_lease_id is None:
+        if self.job is None:
             return
-        refinery_time = self.config.get_transfer_sec("CL-REFINERY")
-        if self.state.tick - self.state.refinery_start_tick >= refinery_time + 1:
-            try:
-                _delete(f"/leases/{self.state.refinery_lease_id}")
-                print(f"  [CRACK] Refinery released")
-            except Exception as e:
-                print(f"  [ERR] refinery release: {e}")
-
-            self.state.refinery_lease_id = None
-            self.state.refinery_start_tick = None
-
-            rb_pos = self.state.get_position("RB")
-            ho_pos = self.state.get_position("HO")
-            if rb_pos > 0:
-                self.execution.place_split_orders("RB", "SELL", rb_pos,
-                                                  order_type="MARKET")
-            if ho_pos > 0:
-                self.execution.place_split_orders("HO", "SELL", ho_pos,
-                                                  order_type="MARKET")
-            self.state.strategy_gross["crack"] -= 30
+        job = self.job
+        refresh_physical(self.state)
+        lease = self.state.leases.get(job["id"])
+        finish = None
+        if lease and lease.get("convert_finish_tick") is not None:
+            finish = ((lease.get("convert_finish_period") or self.state.period) - 1) * self.config.ticks_per_period + lease["convert_finish_tick"]
+        if not job["started"]:
+            if finish is not None:
+                job["started"] = True  # Server confirms use after an ambiguous response.
+                job["due"] = finish + 1
+                self.state.strategy_gross["crack"] += 30
+            elif job["rejected"]:
+                if release_physical_lease(self.state, job["id"]):
+                    self.state.refinery_lease_id = None
+                    self.state.refinery_start_tick = None
+                    self.job = None
+                    print("  [CRACK] Rejected conversion's idle lease closed")
+                    self.storage.release_empty_storage()
+                return
+            else:
+                return  # Ambiguous use: keep tracking; don't submit again or delete it.
+        if physical_time(self.state, self.config) < max(job["due"], finish or 0):
+            return
+        if not job.get("delivered"):
+            if any(self.state.get_position(t) < q for t, q in job["remaining"].items()):
+                return
+            job["delivered"] = True
+        if not job["released"]:
+            job["released"] = release_physical_lease(self.state, job["id"])
+            if job["released"]:
+                print(f"  [CRACK] Refinery {job['id']} released after output arrival")
+        for ticker, quantity in list(job["remaining"].items()):
+            if quantity:
+                job["remaining"][ticker] -= sell_physical_output(job, ticker, quantity, self.state, self.execution)
+        if any(job["remaining"].values()) or not job["released"]:
+            return
+        self.state.refinery_lease_id = None
+        self.state.refinery_start_tick = None
+        self.state.strategy_gross["crack"] -= 30
+        self.job = None
+        self.storage.release_empty_storage()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

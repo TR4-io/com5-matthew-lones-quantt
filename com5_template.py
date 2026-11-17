@@ -312,10 +312,9 @@ def run_pipeline(pipe_ticker, quantity=10):
     Lease a pipeline, use it, return lease_id.
     Pipelines auto-release after transport (30 sec).
     """
-    lease = lease_asset(pipe_ticker)
-    lease_id = lease["id"]
-    use_lease(lease_id, quantity, {"AK-CS-PIPE": "CL-AK", "CS-NYC-PIPE": "CL"}[pipe_ticker])
-    return lease_id
+    source = {"AK-CS-PIPE": "CL-AK", "CS-NYC-PIPE": "CL"}[pipe_ticker]
+    lease = _post("/leases", params={"ticker": pipe_ticker, "from1": source, "quantity1": quantity})
+    return lease["id"]
 
 
 # ── Refinery Helper ──────────────────────────────────────────────────────────
