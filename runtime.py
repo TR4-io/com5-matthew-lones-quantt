@@ -47,7 +47,9 @@ class Client:
                 raise TradingHalt(f'Uncertain server result for {method} {endpoint}; NOT retried')
             if not response.ok:
                 if write:
-                    raise TradingHalt(f'{method} {endpoint} rejected: HTTP {response.status_code}')
+                    # Preserve RIT's rejection reason; never retry a rejected conversion.
+                    detail = ' '.join(response.text.split())[:1000]
+                    raise TradingHalt(f'{method} {endpoint} rejected: HTTP {response.status_code}; server: {detail or "(empty response)"}')
                 response.raise_for_status()
             if response.status_code == 204 or not response.content:
                 return {'success': True}

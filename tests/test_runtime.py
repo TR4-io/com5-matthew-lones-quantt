@@ -104,6 +104,18 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(c.uncertain_write)
         self.assertEqual(session.request.call_count, 1)
 
+    def test_conversion_rejection_preserves_server_reason_without_retry(self):
+        session = Mock()
+        response = session.request.return_value
+        response.status_code = 400
+        response.ok = False
+        response.text = '{"message": "Insufficient input quantity"}'
+        c = Client('http://localhost:9999/v1', {}, live=True, session=session)
+        with self.assertRaisesRegex(TradingHalt, 'Insufficient input quantity'):
+            c.request('POST', '/leases/16', {'from1': 'CL', 'quantity1': 30})
+        self.assertEqual(session.request.call_count, 1)
+        self.assertFalse(c.uncertain_write)
+
     def test_rate_limit_retries_are_bounded(self):
         session = Mock()
         session.request.return_value.status_code = 429

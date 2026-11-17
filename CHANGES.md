@@ -13,7 +13,9 @@ Baseline: MatthewLones/QUANTTxCOM5 e260722ad2adfbc862c963c2e634b70acdb3c5a4. Sch
 
 Sources for request/schema corrections: [official RIT REST 1.0.4 schema](https://rit.306w.ca/RIT-REST-API/1.0.4/swagger.yaml), supplied COM5 case assumptions and the original source. Full physical mode rejects live conversion metadata that does not match those assumptions.
 
-Validation: 37 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+Validation: 38 mocked/offline regression tests; syntax checks; safe --help execution. No live case run or profit claim.
+
+HTTP rejection messages now include the server response body (bounded to 1,000 characters), so a failed conversion reports RIT's reason instead of only HTTP 400. This is a diagnostic correction; the cause of the reported lease-16 rejection is not yet established. A regression test verifies that the reason is preserved and the request is not retried.
 
 ## Live-feedback follow-up
 
