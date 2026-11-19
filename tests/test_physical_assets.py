@@ -199,31 +199,6 @@ class PhysicalTests(unittest.TestCase):
         self.transport.check_pipeline_completions()
         self.assertEqual(self.state.active_pipelines, [])
 
-    def test_two_shipments_reserve_capacity_and_close_independently(self):
-        self.start_ak()
-        self.state.tick += 1
-        self.start_ak()
-        ids = [job['id'] for job in self.state.active_pipelines]
-        self.assertEqual(len(set(ids)), 2)
-        self.assertEqual(sum(l['ticker'] == 'CL-STORAGE' for l in self.leases.values()), 2)
-        self.state.tick = 131
-        self.rows['CL']['position'] = 10
-        self.transport.check_pipeline_completions()
-        self.assertEqual([job['id'] for job in self.state.active_pipelines], ids[1:])
-        self.state.tick += 1
-        self.rows['CL']['position'] = 10
-        self.transport.check_pipeline_completions()
-        self.assertFalse(self.leases)
-        self.assertEqual(self.rows['CL']['position'], 0)
-
-    def test_pipeline_and_refinery_can_start_in_either_order(self):
-        self.start_ak()
-        refinery_id = self.start_refinery()
-        self.assertIsNotNone(refinery_id)
-        self.start_ak()
-        self.assertEqual(len(self.state.active_pipelines), 2)
-        self.assertIn(refinery_id, self.leases)
-
     def test_period_change_retains_conversion_tracking(self):
         self.start_ak()
         self.state._on_period_change(2)

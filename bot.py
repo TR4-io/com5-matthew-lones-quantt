@@ -1179,7 +1179,7 @@ def sell_physical_output(job, ticker, quantity, state, execution):
         return 0
     filled = sum(order.get("quantity_filled", 0) for order in sale["orders"])
     state.update_from_securities(_get("/securities"))
-    if not job.get("concurrent_output") and state.get_position(ticker) != sale["before"] - filled:
+    if state.get_position(ticker) != sale["before"] - filled:
         return 0  # Keep the pending sale; don't sell twice on a stale snapshot.
     del pending[ticker]
     return min(quantity, filled)
@@ -1256,8 +1256,8 @@ class TransportEngine:
         self._start_pipeline("CS-NYC-PIPE", "CL", "CL", "CL-NYC", "NYC", contracts)
 
     def _start_pipeline(self, pipe, source, source_location, destination, destination_location, contracts, buy_input=False):
-        if getattr(self.state, "physical_uncertain", False):
-            return
+        if self.state.active_pipelines or self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
+            return  # Keep one physical batch attributable while it is in flight.
         if pipe in self._unresolved_pipelines:
             return
         refresh_physical(self.state)
@@ -1265,9 +1265,7 @@ class TransportEngine:
         held = self.state.get_position(source)
         if not self.storage.ensure_storage(source_location, max(contracts, held)):
             return
-        incoming = sum(job["quantity"] for job in self.state.active_pipelines
-                       if job["destination"] == destination and not job.get("delivered"))
-        if not self.storage.ensure_storage(destination_location, self.state.get_position(destination) + incoming + contracts):
+        if not self.storage.ensure_storage(destination_location, self.state.get_position(destination) + contracts):
             return
         if held < contracts and buy_input:
             self.execution.place_split_orders(source, "BUY", contracts - held, order_type="MARKET")
@@ -1293,10 +1291,6 @@ class TransportEngine:
         self.state.active_pipelines.append({"id": lease_id, "pipe": pipe, "destination": destination,
             "due": physical_time(self.state, self.config) + self.config.get_transfer_sec(pipe) + 1,
             "remaining": contracts, "quantity": contracts})
-        same_destination = [job for job in self.state.active_pipelines if job["destination"] == destination]
-        if len(same_destination) > 1:
-            for job in same_destination:
-                job["concurrent_output"] = True
         self.state.strategy_gross["transport"] += contracts
         print(f"  [TRANSPORT] {pipe} started with {contracts} {source}; lease {lease_id}")
 
@@ -1350,7 +1344,7 @@ class CrackEngine:
         refinery_time = self.config.get_transfer_sec("CL-REFINERY")
         if tick >= self.config.ticks_per_period - refinery_time - 15:
             return
-        if self.state.refinery_lease_id is not None or self.creation_uncertain or getattr(self.state, "physical_uncertain", False):
+        if self.state.refinery_lease_id is not None or self.state.active_pipelines or self.creation_uncertain or getattr(self.state, "physical_uncertain", False):
             return
         refresh_physical(self.state)
 
