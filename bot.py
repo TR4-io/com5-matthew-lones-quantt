@@ -1256,13 +1256,21 @@ class TransportEngine:
         self._start_pipeline("CS-NYC-PIPE", "CL", "CL", "CL-NYC", "NYC", contracts)
 
     def _start_pipeline(self, pipe, source, source_location, destination, destination_location, contracts, buy_input=False):
-        if self.state.active_pipelines or self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
-            return  # Keep one physical batch attributable while it is in flight.
+        if self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
+            return
+        if any(job["pipe"] == pipe for job in self.state.active_pipelines):
+            return  # One outstanding shipment per route.
         if pipe in self._unresolved_pipelines:
             return
         refresh_physical(self.state)
         # Rent capacity at BOTH ends before submitting the conversion.
         held = self.state.get_position(source)
+        # The upstream job owns its delivery until its sale is reconciled.
+        # Today's CL position can already include that delivery.
+        reserved = sum(job["remaining"] for job in self.state.active_pipelines
+                       if job["destination"] == source)
+        if not buy_input and held - reserved < contracts:
+            return
         if not self.storage.ensure_storage(source_location, max(contracts, held)):
             return
         if not self.storage.ensure_storage(destination_location, self.state.get_position(destination) + contracts):

@@ -199,6 +199,28 @@ class PhysicalTests(unittest.TestCase):
         self.transport.check_pipeline_completions()
         self.assertEqual(self.state.active_pipelines, [])
 
+    def test_overlap_only_across_routes_with_independent_crude(self):
+        self.start_ak()
+        self.start_ak()
+        self.assertEqual(len(self.state.active_pipelines), 1)
+        def start_nyc():
+            self.transport._start_pipeline('CS-NYC-PIPE', 'CL', 'CL', 'CL-NYC', 'NYC', 10)
+        self.rows['CL']['position'] = 10
+        start_nyc()
+        self.assertEqual(len(self.state.active_pipelines), 1)
+        self.rows['CL']['position'] = 20
+        start_nyc()
+        self.assertEqual(len(self.state.active_pipelines), 2)
+        start_nyc()
+        self.assertEqual(len(self.state.active_pipelines), 2)
+        self.rows['CL-NYC']['position'] = 10
+        self.state.tick = 131
+        self.transport.check_pipeline_completions()
+        self.assertEqual(self.state.active_pipelines, [])
+        self.assertEqual(self.rows['CL']['position'], 0)
+        self.assertEqual(self.rows['CL-NYC']['position'], 0)
+        self.assertEqual(self.leases, {})
+
     def test_period_change_retains_conversion_tracking(self):
         self.start_ak()
         self.state._on_period_change(2)
