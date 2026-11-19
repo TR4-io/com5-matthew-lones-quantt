@@ -2291,4 +2291,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from chart_strategy import main as run_chart
+    run_chart()
