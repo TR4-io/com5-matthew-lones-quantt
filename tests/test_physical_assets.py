@@ -202,7 +202,6 @@ class PhysicalTests(unittest.TestCase):
 
     def test_overlap_only_across_routes_with_independent_crude(self):
         self.start_ak()
-        self.start_ak()
         self.assertEqual(len(self.state.active_pipelines), 1)
         def start_nyc():
             self.transport._start_pipeline('CS-NYC-PIPE', 'CL', 'CL', 'CL-NYC', 'NYC', 10)
@@ -222,10 +221,11 @@ class PhysicalTests(unittest.TestCase):
         self.assertEqual(self.rows['CL-NYC']['position'], 0)
         self.assertEqual(self.leases, {})
 
-    def test_route_ramps_only_after_sale_and_lease_cleanup(self):
-        for size in (1, 2, 3, 3):
-            for _ in range(4):
-                self.start_ak()
+    def test_first_profitable_evaluation_starts_full_size_then_cleans_up(self):
+        self.state.tick = 150
+        for size in (3, 3):
+            self.transport.evaluate()
+            self.transport.evaluate()  # A repeated evaluation cannot add a fourth batch.
             self.assertEqual(len(self.state.active_pipelines), size)
             self.state.tick += 32
             self.transport.check_pipeline_completions()

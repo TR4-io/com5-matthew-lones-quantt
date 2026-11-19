@@ -1198,7 +1198,7 @@ class TransportEngine:
         self._cs_nyc_cooldown_until = 0
         self.COOLDOWN_TICKS = 60  # retained original opportunity cooldown
         self._unresolved_pipelines = set()
-        self.route_capacity = defaultdict(lambda: 1)
+        self.shipments_per_route = 3
         self.wave_started = defaultdict(int)
 
     def evaluate(self):
@@ -1208,10 +1208,18 @@ class TransportEngine:
             return
         if tick >= self.config.wind_down_start:
             return
-        if tick >= self._ak_cs_cooldown_until:
-            self._check_ak_to_cushing()
-        if tick >= self._cs_nyc_cooldown_until:
-            self._check_cushing_to_nyc()
+        for pipe, cooldown, check in (
+            ("AK-CS-PIPE", self._ak_cs_cooldown_until, self._check_ak_to_cushing),
+            ("CS-NYC-PIPE", self._cs_nyc_cooldown_until, self._check_cushing_to_nyc),
+        ):
+            if tick < cooldown:
+                continue
+            while self.wave_started[pipe] < self.shipments_per_route:
+                previous = self.wave_started[pipe]
+                refresh_physical(self.state)
+                check()
+                if self.wave_started[pipe] == previous:
+                    break  # No shipment started. Reevaluate on the next tick.
 
     def _check_ak_to_cushing(self):
         cl_bid, _, cl_last = self.state.get_price("CL")
@@ -1264,7 +1272,7 @@ class TransportEngine:
     def _start_pipeline(self, pipe, source, source_location, destination, destination_location, contracts, buy_input=False):
         if self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
             return
-        if self.wave_started[pipe] >= self.route_capacity[pipe]:
+        if self.wave_started[pipe] >= self.shipments_per_route:
             return  # Finish this group of shipments before opening another.
         if pipe in self._unresolved_pipelines:
             return
@@ -1351,10 +1359,7 @@ class TransportEngine:
             if any(row.get("containment_usage") == 0 and row["ticker"].endswith("-STORAGE")
                    for row in self.state.leases.values()):
                 return
-            for pipe, count in self.wave_started.items():
-                if count:
-                    self.route_capacity[pipe] = min(3, count + 1)
-                    self.wave_started[pipe] = 0
+            self.wave_started.clear()
 
 
 
