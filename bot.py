@@ -1179,7 +1179,9 @@ def sell_physical_output(job, ticker, quantity, state, execution):
         return 0
     filled = sum(order.get("quantity_filled", 0) for order in sale["orders"])
     state.update_from_securities(_get("/securities"))
-    if state.get_position(ticker) != sale["before"] - filled:
+    # Other deliveries can change this same position. Each terminal order ID
+    # belongs to exactly one job and confirms how much that job sold.
+    if not job.get("shared_destination") and state.get_position(ticker) != sale["before"] - filled:
         return 0  # Keep the pending sale; don't sell twice on a stale snapshot.
     del pending[ticker]
     return min(quantity, filled)
@@ -1196,6 +1198,8 @@ class TransportEngine:
         self._cs_nyc_cooldown_until = 0
         self.COOLDOWN_TICKS = 60  # retained original opportunity cooldown
         self._unresolved_pipelines = set()
+        self.route_capacity = defaultdict(lambda: 1)
+        self.wave_started = defaultdict(int)
 
     def evaluate(self):
         tick = self.state.tick
@@ -1212,11 +1216,12 @@ class TransportEngine:
     def _check_ak_to_cushing(self):
         cl_bid, _, cl_last = self.state.get_price("CL")
         _, ak_ask, ak_last = self.state.get_price("CL-AK")
-        if not all([cl_last, ak_last]):
+        if not cl_bid or not ak_ask:
             return
 
-        spread = cl_last - ak_last
+        spread = cl_bid - ak_ask
         breakeven = self.config.ak_cs_breakeven()
+        breakeven += (2 * (self.config.get_asset_cost("AK-STORAGE") + self.config.get_asset_cost("CL-STORAGE")) + 20 * self.config.fee_per_contract) / 10000
         required = breakeven + self.config.ak_cs_buffer
         if spread < required:
             return
@@ -1233,13 +1238,14 @@ class TransportEngine:
         self._start_pipeline("AK-CS-PIPE", "CL-AK", "AK", "CL", "CL", contracts, buy_input=True)
 
     def _check_cushing_to_nyc(self):
-        _, _, cl_last = self.state.get_price("CL")
+        _, cl_ask, cl_last = self.state.get_price("CL")
         nyc_bid, _, nyc_last = self.state.get_price("CL-NYC")
-        if not all([cl_last, nyc_last]):
+        if not cl_ask or not nyc_bid:
             return
 
-        spread = nyc_last - cl_last
+        spread = nyc_bid - cl_ask
         breakeven = self.config.cs_nyc_breakeven()
+        breakeven += (2 * (self.config.get_asset_cost("CL-STORAGE") + self.config.get_asset_cost("NYC-STORAGE")) + 20 * self.config.fee_per_contract) / 10000
         required = breakeven + self.config.cs_nyc_buffer
         if spread < required:
             return
@@ -1258,8 +1264,8 @@ class TransportEngine:
     def _start_pipeline(self, pipe, source, source_location, destination, destination_location, contracts, buy_input=False):
         if self.state.refinery_lease_id is not None or getattr(self.state, "physical_uncertain", False):
             return
-        if any(job["pipe"] == pipe for job in self.state.active_pipelines):
-            return  # One outstanding shipment per route.
+        if self.wave_started[pipe] >= self.route_capacity[pipe]:
+            return  # Finish this group of shipments before opening another.
         if pipe in self._unresolved_pipelines:
             return
         refresh_physical(self.state)
@@ -1273,7 +1279,11 @@ class TransportEngine:
             return
         if not self.storage.ensure_storage(source_location, max(contracts, held)):
             return
-        if not self.storage.ensure_storage(destination_location, self.state.get_position(destination) + contracts):
+        incoming = sum(job["quantity"] for job in self.state.active_pipelines
+                       if job["destination"] == destination and not job.get("delivered"))
+        if self.state.available_net_buy(destination) < incoming + contracts:
+            return
+        if not self.storage.ensure_storage(destination_location, self.state.get_position(destination) + incoming + contracts):
             return
         if held < contracts and buy_input:
             self.execution.place_split_orders(source, "BUY", contracts - held, order_type="MARKET")
@@ -1299,6 +1309,11 @@ class TransportEngine:
         self.state.active_pipelines.append({"id": lease_id, "pipe": pipe, "destination": destination,
             "due": physical_time(self.state, self.config) + self.config.get_transfer_sec(pipe) + 1,
             "remaining": contracts, "quantity": contracts})
+        peers = [job for job in self.state.active_pipelines if job["destination"] == destination]
+        if len(peers) > 1:
+            for job in peers:
+                job["shared_destination"] = True
+        self.wave_started[pipe] += 1
         self.state.strategy_gross["transport"] += contracts
         print(f"  [TRANSPORT] {pipe} started with {contracts} {source}; lease {lease_id}")
 
@@ -1332,6 +1347,15 @@ class TransportEngine:
             self.state.strategy_gross["transport"] -= job["quantity"]
             print(f"  [TRANSPORT] {job['pipe']} delivered, sold, and lease closed")
         self.storage.release_empty_storage()
+        if not self.state.active_pipelines and self.state.refinery_lease_id is None:
+            if any(row.get("containment_usage") == 0 and row["ticker"].endswith("-STORAGE")
+                   for row in self.state.leases.values()):
+                return
+            for pipe, count in self.wave_started.items():
+                if count:
+                    self.route_capacity[pipe] = min(3, count + 1)
+                    self.wave_started[pipe] = 0
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1356,10 +1380,10 @@ class CrackEngine:
             return
         refresh_physical(self.state)
 
-        _, _, cl_last = self.state.get_price("CL")
-        _, _, rb_last = self.state.get_price("RB")
-        _, _, ho_last = self.state.get_price("HO")
-        if not all([cl_last, rb_last, ho_last]):
+        _, cl_ask, _ = self.state.get_price("CL")
+        rb_bid, _, _ = self.state.get_price("RB")
+        ho_bid, _, _ = self.state.get_price("HO")
+        if not all([cl_ask, rb_bid, ho_bid]):
             return
 
         cl_size = self.config.get_contract_size("CL")
@@ -1367,17 +1391,26 @@ class CrackEngine:
         ho_size = self.config.get_contract_size("HO")
 
         # 3:2:1 crack
-        revenue = rb_last * 20 * rb_size + ho_last * 10 * ho_size
-        cost = cl_last * 30 * cl_size
+        revenue = rb_bid * 20 * rb_size + ho_bid * 10 * ho_size
+        cost = cl_ask * 30 * cl_size
         refinery_cost = self.config.get_asset_cost("CL-REFINERY")
-        net_profit = revenue - cost - refinery_cost - (60 * self.config.fee_per_contract)
+        net_profit = revenue - cost - refinery_cost - 6 * self.config.get_asset_cost("CL-STORAGE") - (60 * self.config.fee_per_contract)
 
         if net_profit < self.config.crack_min_profit:
             return
-        if self.state.get_position("CL") < 30:
-            return
         if self.state.available_gross("crack") < 30:
             return
+        missing = max(0, 30 - self.state.get_position("CL"))
+        if missing:
+            if missing > self.state.available_net_buy("CL") or not self.storage.ensure_storage("CL", 30):
+                return
+            self.execution.place_split_orders("CL", "BUY", missing, order_type="MARKET")
+            refresh_physical(self.state)
+            if self.state.get_position("CL") < 30:
+                self.creation_uncertain = True
+                print("  [CRACK] Input purchase unconfirmed. Check RIT inventory before restarting refinement.")
+                self.storage.release_empty_storage()
+                return
 
         print(f"  [CRACK] Profitable! revenue=${revenue:.0f} cost=${cost:.0f} "
               f"net=${net_profit:.0f}")

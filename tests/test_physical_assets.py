@@ -169,10 +169,11 @@ class PhysicalTests(unittest.TestCase):
         self.assertEqual(self.rows['HO']['position'], 0)
         self.assertEqual(self.leases, {})
 
-    def test_refinery_does_not_start_without_full_input_batch(self):
+    def test_refinery_buys_missing_input(self):
         self.rows['CL']['position'] = 29
         self.refinery.evaluate()
-        self.assertEqual(self.calls, [])
+        self.assertIsNotNone(self.state.refinery_lease_id)
+        self.assertEqual(self.rows['CL']['position'], 0)
 
     def test_storage_kept_for_incoming_delivery_and_occupied_tanks(self):
         self.start_ak()
@@ -220,6 +221,20 @@ class PhysicalTests(unittest.TestCase):
         self.assertEqual(self.rows['CL']['position'], 0)
         self.assertEqual(self.rows['CL-NYC']['position'], 0)
         self.assertEqual(self.leases, {})
+
+    def test_route_ramps_only_after_sale_and_lease_cleanup(self):
+        for size in (1, 2, 3, 3):
+            for _ in range(4):
+                self.start_ak()
+            self.assertEqual(len(self.state.active_pipelines), size)
+            self.state.tick += 32
+            self.transport.check_pipeline_completions()
+            self.assertEqual(len(self.state.active_pipelines), size)
+            self.rows['CL']['position'] += 10 * size
+            self.transport.check_pipeline_completions()
+            self.assertFalse(self.state.active_pipelines)
+            self.assertEqual(self.rows['CL']['position'], 0)
+            self.assertFalse(self.leases)
 
     def test_period_change_retains_conversion_tracking(self):
         self.start_ak()
